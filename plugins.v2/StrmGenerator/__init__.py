@@ -55,21 +55,21 @@ class FileMonitorHandler(FileSystemEventHandler):
                                 mon_path=self._watch_path, event_path=event.dest_path)
 
 
-class CloudStrmCompanion(_PluginBase):
+class StrmGenerator(_PluginBase):
     # 插件名称
-    plugin_name = "云盘Strm助手"
+    plugin_name = "Strm生成器"
     # 插件描述
-    plugin_desc = "实时监控、定时全量增量生成strm文件。"
+    plugin_desc = "实时/定时监控生成strm文件"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.2.7"
+    plugin_version = "1.0"
     # 插件作者
-    plugin_author = "thsrite"
+    plugin_author = "LunaticXJ"
     # 作者主页
-    author_url = "https://github.com/thsrite"
+    author_url = "https://github.com/LunaticXJ"
     # 插件配置项ID前缀
-    plugin_config_prefix = "cloudstrmCompanion_"
+    plugin_config_prefix = "strmGenerator_"
     # 加载顺序
     plugin_order = 26
     # 可使用的用户级别
@@ -309,18 +309,18 @@ class CloudStrmCompanion(_PluginBase):
 
         if event:
             event_data = event.event_data
-            if not event_data or event_data.get("action") != "CloudStrmCompanion":
+            if not event_data or event_data.get("action") != "StrmGenerator":
                 return
-            logger.info("收到命令，开始云盘Strm助手同步生成 ...")
+            logger.info("收到命令，开始云盘Strm生成 ...")
             self.post_message(channel=event.event_data.get("channel"),
-                              title="开始云盘Strm助手同步生成 ...",
+                              title="开始云盘Strm生成 ...",
                               userid=event.event_data.get("user"))
 
         if not self._115client:
             logger.error("115_cookie 未配置或cookie已失效，请检查配置")
             return
 
-        logger.info("云盘Strm助手同步生成任务开始")
+        logger.info("云盘Strm同步生成任务开始")
         # 首次扫描或者重建索引
         if Path(self._cloud_files_json).exists():
             logger.info("尝试加载本地缓存")
@@ -1021,12 +1021,12 @@ class CloudStrmCompanion(_PluginBase):
         """
         return [
             {
-                "cmd": "/cloud_strm_companion",
+                "cmd": "/strm_generator",
                 "event": EventType.PluginAction,
-                "desc": "云盘Strm助手同步",
+                "desc": "云盘Strm生成器",
                 "category": "",
                 "data": {
-                    "action": "CloudStrmCompanion"
+                    "action": "StrmGenerator"
                 }
             },
             {
@@ -1053,8 +1053,8 @@ class CloudStrmCompanion(_PluginBase):
         """
         if self._enabled and self._cron:
             return [{
-                "id": "CloudStrmCompanion",
-                "name": "云盘Strm助手同步",
+                "id": "StrmGenerator",
+                "name": "云盘Strm生成器",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.scan,
                 "kwargs": {}
