@@ -61,7 +61,7 @@ class StrmGenerator(_PluginBase):
     # 插件描述
     plugin_desc = "实时/定时监控生成strm文件"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/cloudcompanion.png"
+    plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
     plugin_version = "1.0"
     # 插件作者
