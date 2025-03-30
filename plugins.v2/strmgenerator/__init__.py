@@ -71,7 +71,7 @@ class StrmGenerator(_PluginBase):
     # 插件配置项ID前缀
     plugin_config_prefix = "strmGenerator_"
     # 加载顺序
-    plugin_order = 26
+    plugin_order = 1
     # 可使用的用户级别
     auth_level = 1
 
