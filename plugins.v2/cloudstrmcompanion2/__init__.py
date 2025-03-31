@@ -55,7 +55,7 @@ class FileMonitorHandler(FileSystemEventHandler):
                                 mon_path=self._watch_path, event_path=event.dest_path)
 
 
-class CloudStrmCompanion(_PluginBase):
+class CloudStrmCompanion2(_PluginBase):
     # 插件名称
     plugin_name = "云盘Strm助手"
     # 插件描述
@@ -69,9 +69,9 @@ class CloudStrmCompanion(_PluginBase):
     # 作者主页
     author_url = "https://github.com/thsrite"
     # 插件配置项ID前缀
-    plugin_config_prefix = "cloudstrmCompanion_"
+    plugin_config_prefix = "cloudstrmCompanion2_"
     # 加载顺序
-    plugin_order = 26
+    plugin_order = 2
     # 可使用的用户级别
     auth_level = 1
 
@@ -309,7 +309,7 @@ class CloudStrmCompanion(_PluginBase):
 
         if event:
             event_data = event.event_data
-            if not event_data or event_data.get("action") != "CloudStrmCompanion":
+            if not event_data or event_data.get("action") != "CloudStrmCompanion2":
                 return
             logger.info("收到命令，开始云盘Strm助手同步生成 ...")
             self.post_message(channel=event.event_data.get("channel"),
@@ -1021,12 +1021,12 @@ class CloudStrmCompanion(_PluginBase):
         """
         return [
             {
-                "cmd": "/cloud_strm_companion",
+                "cmd": "/cloud_strm_companion2",
                 "event": EventType.PluginAction,
                 "desc": "云盘Strm助手同步",
                 "category": "",
                 "data": {
-                    "action": "CloudStrmCompanion"
+                    "action": "CloudStrmCompanion2"
                 }
             },
             {
@@ -1053,7 +1053,7 @@ class CloudStrmCompanion(_PluginBase):
         """
         if self._enabled and self._cron:
             return [{
-                "id": "CloudStrmCompanion",
+                "id": "CloudStrmCompanion2",
                 "name": "云盘Strm助手同步",
                 "trigger": CronTrigger.from_crontab(self._cron),
                 "func": self.scan,
