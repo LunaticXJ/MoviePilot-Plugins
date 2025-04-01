@@ -6,7 +6,7 @@
     "version": "1.0",
     "icon": "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png",
     "author": "LunaticXJ",
-    "level": 1,
+    "level": 1.1,
     "history": {
       "v1.0": "实时监控、定时全量增量生成strm文件"
     }
