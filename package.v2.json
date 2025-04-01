@@ -3,10 +3,10 @@
     "name": "Strm生成器",
     "description": "实时监控、定时全量增量生成strm文件。",
     "labels": "云盘",
-    "version": "1.0",
+    "version": "1.1",
     "icon": "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png",
     "author": "LunaticXJ",
-    "level": 1.1,
+    "level": 1,
     "history": {
       "v1.0": "实时监控、定时全量增量生成strm文件"
     }
