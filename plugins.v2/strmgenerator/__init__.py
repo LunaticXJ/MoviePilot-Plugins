@@ -17,7 +17,7 @@ import pytz
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from posixpatht import escape
+from urllib.parse import quote
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
 
@@ -770,7 +770,9 @@ class StrmGenerator(_PluginBase):
             level_indicator = match.group(0)
             depth = (len(level_indicator) // 2) - 1
             # 获取当前行的目录名称，去掉前面的 '| ' 或 '- '
-            item_name = escape(line.strip()[len(level_indicator):].strip())
+            #item_name = escape(line.strip()[len(level_indicator):].strip())
+            item_name = quote(line.strip()[len(level_indicator):].strip(), safe='')
+
 
             # 根据深度更新当前路径
             if depth < len(current_path):
