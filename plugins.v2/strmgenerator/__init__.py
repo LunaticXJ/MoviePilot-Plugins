@@ -17,7 +17,6 @@ import pytz
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from p115client import P115Client
 from posixpatht import escape
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
@@ -99,7 +98,6 @@ class StrmGenerator(_PluginBase):
     _rmt_mediaext = None
     _other_mediaext = None
     _115_cookie = None
-    _115client = None
     _interval: int = 10
     _mediaservers = None
     mediaserver_helper = None
@@ -117,6 +115,7 @@ class StrmGenerator(_PluginBase):
     _event = threading.Event()
 
     def init_plugin(self, config: dict = None):
+        logger.debug(f"初始化插件 {self.plugin_name}")  # 添加调试日志
         # 清空配置
         self._strm_dir_conf = {}
         self._cloud_dir_conf = {}
@@ -154,7 +153,6 @@ class StrmGenerator(_PluginBase):
             self._115_cookie = config.get("115_cookie")
             if self._115_cookie:
                 self._headers["Cookie"] = self._115_cookie
-                self._115client = P115Client(self._115_cookie, check_for_relogin=True)
             if config.get("emby_path"):
                 for path in str(config.get("emby_path")).split(","):
                     self._emby_paths[path.split(":")[0]] = path.split(":")[1]
@@ -316,8 +314,8 @@ class StrmGenerator(_PluginBase):
                               title="开始云盘Strm生成 ...",
                               userid=event.event_data.get("user"))
 
-        if not self._115client:
-            logger.error("115_cookie 未配置或cookie已失效，请检查配置")
+        if not self._115_cookie:
+            logger.error("115_cookie 未配置")
             return
 
         logger.info("云盘Strm同步生成任务开始")
@@ -661,6 +659,48 @@ class StrmGenerator(_PluginBase):
                     logger.info(f"等待目录树生成完成，剩余重试 {retry_cnt} 次")
                     time.sleep(3)
         return None
+    
+    def fs_dir_getid(self, path):
+        """
+        115路径转成ID
+        """
+        export_api = "https://webapi.115.com/files/getid"
+        response = requests.get(url=export_api,
+                                 headers=self._headers,
+                                 params={"path": path})
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("state"):
+                return result.get("id")
+        return None
+    
+    def download_url(self, pickcode):
+        """
+        获取115文件下载地址
+        """
+        export_api = "https://webapi.115.com/files/download"
+        response = requests.get(url=export_api,
+                                 headers=self._headers,
+                                 params={"pickcode": pickcode,"dl":"1"})
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("state"):
+                return result.get("file_url_302")
+        return None
+    def fs_delete(self,pid, fid):
+        """
+        删除115文件
+        """
+        export_api = "https://webapi.115.com/rb/delete"
+        response = requests.post(url=export_api,
+                                 headers=self._headers,
+                                 data={"fid[0]": fid, "pid": pid})
+        if response.status_code == 200:
+            result = response.json()
+            if not result.get("state"):
+                    logger.error(f"目录树删除失败,{result.get('error')}")
+                    return False
+        return True
 
     def retrieve_directory_structure(self, directory_path):
         """
@@ -669,7 +709,7 @@ class StrmGenerator(_PluginBase):
         file_id = None
         try:
             logger.info(f"开始生成 {directory_path} 目录树")
-            dir_info = self._115client.fs_dir_getid(directory_path)
+            dir_info = self.fs_dir_getid(directory_path)
             if not dir_info:
                 logger.error(f"{directory_path} 目录不存在或路径错误")
                 return
@@ -682,7 +722,7 @@ class StrmGenerator(_PluginBase):
                 logger.error(f"{directory_path} 生成目录数失败")
                 return
             # 获取目录树下载链接
-            download_url = self._115client.download_url(pick_code, headers=self._headers)
+            download_url = self.download_url(pick_code, headers=self._headers)
             directory_content = self.fetch_content(download_url)
             logger.info(f"{directory_path} 目录树下载成功")
             return directory_content
@@ -691,7 +731,7 @@ class StrmGenerator(_PluginBase):
         finally:
             if file_id:
                 try:
-                    self._115client.fs_delete(file_id)
+                    self.fs_delete(fid,"U_1_0")
                 except:
                     pass
 
