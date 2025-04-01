@@ -709,11 +709,7 @@ class StrmGenerator(_PluginBase):
         file_id = None
         try:
             logger.info(f"开始生成 {directory_path} 目录树")
-            dir_info = self.fs_dir_getid(directory_path)
-            if not dir_info:
-                logger.error(f"{directory_path} 目录不存在或路径错误")
-                return
-            fid = dir_info.get("id")
+            fid = self.fs_dir_getid(directory_path)
             if not fid:
                 logger.error(f"{directory_path} 目录不存在或路径错误")
                 return
