@@ -62,7 +62,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.2"
+    plugin_version = "1.3"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -687,7 +687,8 @@ class StrmGenerator(_PluginBase):
             if result.get("state"):
                 return result.get("file_url_302")
         return None
-    def fs_delete(self, pid, fid):
+    
+    def fs_delete(self,fid,pid):
         """
         删除115文件
         """
@@ -698,9 +699,7 @@ class StrmGenerator(_PluginBase):
         if response.status_code == 200:
             result = response.json()
             if not result.get("state"):
-                    logger.error(f"目录树删除失败,{result.get('error')}")
-                    return False
-        return True
+                    logger.info(f"目录树删除失败,{result.get('error')}")
 
     def retrieve_directory_structure(self, directory_path):
         """
