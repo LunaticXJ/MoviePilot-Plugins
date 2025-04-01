@@ -632,14 +632,14 @@ class StrmGenerator(_PluginBase):
         # 未匹配到路径，返回原路径
         return file_path
 
-    def export_dir(self, fid, destination_id="0"):
+    def export_dir(self, dir_id, destination_id="0"):
         """
         获取目录导出id
         """
         export_api = "https://webapi.115.com/files/export_dir"
         response = requests.post(url=export_api,
                                  headers=self._headers,
-                                 data={"file_ids": fid, "target": f"U_1_{destination_id}"})
+                                 data={"file_ids": dir_id, "target": f"U_1_{destination_id}"})
         if response.status_code == 200:
             result = response.json()
             if result.get("state"):
@@ -656,7 +656,7 @@ class StrmGenerator(_PluginBase):
                             if str(export_id) == str(result.get("data", {}).get("export_id")):
                                 return result.get("data", {}).get("pick_code"), result.get("data", {}).get("file_id")
                     retry_cnt -= 1
-                    logger.info(f"等待目录树生成完成，剩余重试 {retry_cnt} 次")
+                    logger.info(f"等待目录树生成完成，剩余轮询 {retry_cnt} 次")
                     time.sleep(3)
         return None
     
@@ -708,11 +708,11 @@ class StrmGenerator(_PluginBase):
         file_id = None
         try:
             logger.info(f"开始生成 {directory_path} 目录树")
-            fid = self.fs_dir_getid(directory_path)
-            if not fid:
+            dir_id = self.fs_dir_getid(directory_path)
+            if not dir_id:
                 logger.error(f"{directory_path} 目录不存在或路径错误")
                 return
-            pick_code, file_id = self.export_dir(fid)
+            pick_code, file_id = self.export_dir(dir_id)
             if not pick_code:
                 logger.error(f"{directory_path} 生成目录数失败")
                 return
@@ -726,7 +726,7 @@ class StrmGenerator(_PluginBase):
         finally:
             if file_id:
                 try:
-                    self.fs_delete(fid,"U_1_0")
+                    self.fs_delete(file_id,"U_1_0")
                 except:
                     pass
 
