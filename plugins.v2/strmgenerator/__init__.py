@@ -11,7 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from posixpath import join as join_path
 from re import compile as re_compile
-from typing import Any, List, Dict, Tuple, Optional
+from typing import Any, Final, List, Dict, Mapping, Tuple, Optional
 
 import pytz
 import requests
@@ -32,6 +32,7 @@ from app.schemas.types import EventType, NotificationType, MediaType
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
+CRE_SET_COOKIE: Final = re_compile(r"[0-9a-f]{32}=[0-9a-f]{32}.*")
 lock = threading.Lock()
 
 
@@ -62,7 +63,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.4"
+    plugin_version = "1.5"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -681,12 +682,30 @@ class StrmGenerator(_PluginBase):
         export_api = "https://webapi.115.com/files/download"
         response = requests.get(url=export_api,
                                  headers=self._headers,
-                                 params={"pickcode": pickcode,"dl":"1"})
+                                 params={"pickcode": pickcode,"dl": 1}) 
+        download_url = None
         if response.status_code == 200:
             result = response.json()
             if result.get("state"):
-                return result.get("file_url_302")
-        return None
+                response = requests.get(result.get("file_url_302"), headers=self._headers)
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get("state"):
+                        download_url = result.get("file_url")
+                        # 处理Set-Cookie
+                        if isinstance(response.headers, Mapping):
+                            match = CRE_SET_COOKIE.search(response.headers["Set-Cookie"])
+                            if match is not None:
+                                self._headers["Cookie"] += f";{match[0]}"
+                        else:
+                            for k, v in reversed(response.headers.items()):
+                                if k == "Set-Cookie" and CRE_SET_COOKIE.match(v) is not None:
+                                    self._headers["Cookie"] += f";{v}"
+                                    break
+        return download_url
+    
+
+
     
     def fs_delete(self,fid,pid):
         """
@@ -765,8 +784,9 @@ class StrmGenerator(_PluginBase):
             level_indicator = match.group(0)
             depth = (len(level_indicator) // 2) - 1
             # 获取当前行的目录名称，去掉前面的 '| ' 或 '- '
+            item_name = line.strip()[len(level_indicator):].strip()
             #item_name = escape(line.strip()[len(level_indicator):].strip())
-            item_name = quote(line.strip()[len(level_indicator):].strip(), safe='')
+            #item_name = quote(line.strip()[len(level_indicator):].strip(), safe='')
 
 
             # 根据深度更新当前路径
