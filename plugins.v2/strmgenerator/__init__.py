@@ -63,7 +63,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.5"
+    plugin_version = "2.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -93,7 +93,7 @@ class StrmGenerator(_PluginBase):
     _cloud_dir_conf = {}
     _category_conf = {}
     _format_conf = {}
-    _cloud_files = []
+    _cloud_files = set()
     _observer = []
     _medias = {}
     _rmt_mediaext = None
@@ -110,10 +110,29 @@ class StrmGenerator(_PluginBase):
         "Cookie": "",
     }
 
+    # 新增：预计算的扩展名集合
+    _rmt_mediaext_set = set()
+    _other_mediaext_set = set()
+
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
     # 退出事件
     _event = threading.Event()
+
+
+    def __init__(self):
+        """
+        构造方法，初始化基本属性和扩展名集合
+        """
+        super().__init__()  # 调用父类 _PluginBase 的构造方法
+        
+        # 设置默认的媒体扩展名（如果未在配置中指定）
+        if not self._rmt_mediaext:
+            self._rmt_mediaext = ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v"
+        
+        # 预先将扩展名转换为 set，提高查找效率
+        self._rmt_mediaext_set = {ext.strip().lower() for ext in self._rmt_mediaext.split(",")}
+        self._other_mediaext_set = {ext.strip().lower() for ext in (self._other_mediaext or "").split(",") if ext.strip()}
 
     def init_plugin(self, config: dict = None):
         logger.debug(f"初始化插件 {self.plugin_name}")  # 添加调试日志
@@ -143,14 +162,19 @@ class StrmGenerator(_PluginBase):
             self._url = config.get("url")
             self._mediaservers = config.get("mediaservers") or []
             self._other_mediaext = config.get("other_mediaext")
-            # 新增：读取路径替换规则
+
+            self._rmt_mediaext = config.get("rmt_mediaext") or self._rmt_mediaext
+            # 更新扩展名集合
+            self._rmt_mediaext_set = {ext.strip().lower() for ext in self._rmt_mediaext.split(",")}
+            self._other_mediaext_set = {ext.strip().lower() for ext in (self._other_mediaext or "").split(",") if ext.strip()}
+            
+            # 读取路径替换规则
             if config.get("path_replacements"):
                 for replacement in str(config.get("path_replacements")).split("\n"):
                     if replacement and ":" in replacement:
                         source, target = replacement.split(":", 1)
                         self._path_replacements[source.strip()] = target.strip()
-            self._rmt_mediaext = config.get(
-                "rmt_mediaext") or ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v"
+
             self._115_cookie = config.get("115_cookie")
             if self._115_cookie:
                 self._headers["Cookie"] = self._115_cookie
@@ -159,13 +183,19 @@ class StrmGenerator(_PluginBase):
                     self._emby_paths[path.split(":")[0]] = path.split(":")[1]
 
         if self._rebuild:
-            logger.info("开始清理旧数据索引")
+            logger.info("开始清理文件索引")
             self._rebuild = False
-            self._cloud_files = []
+            self._cloud_files = set()
             if Path(self._cloud_files_json).exists():
                 Path(self._cloud_files_json).unlink()
-            logger.info("旧数据索引清理完成")
+            logger.info("文件索引清理完成")
             self.__update_config()
+        elif Path(self._cloud_files_json).exists():
+            logger.info("加载文件索引")
+            with open(self._cloud_files_json, 'r') as file:
+                content = file.read()
+                if content:
+                    self._cloud_files = set(json.loads(content))
 
         # 停止现有任务
         self.stop_service()
@@ -300,10 +330,16 @@ class StrmGenerator(_PluginBase):
     @eventmanager.register(EventType.PluginAction)
     def scan(self, event: Event = None):
         """
-        扫描
+        云盘全量扫描
         """
+        # 记录开始时间
+        start_time = time.time()
+
         if not self._strm_dir_conf or not self._strm_dir_conf.keys():
             logger.error("未获取到可用目录监控配置，请检查")
+            return
+        if not self._115_cookie:
+            logger.error("115_cookie 未配置")
             return
 
         if event:
@@ -314,94 +350,117 @@ class StrmGenerator(_PluginBase):
             self.post_message(channel=event.event_data.get("channel"),
                               title="开始云盘Strm生成 ...",
                               userid=event.event_data.get("user"))
-
-        if not self._115_cookie:
-            logger.error("115_cookie 未配置")
-            return
-
         logger.info("云盘Strm同步生成任务开始")
-        # 首次扫描或者重建索引
-        if Path(self._cloud_files_json).exists():
-            logger.info("尝试加载本地缓存")
-            # 尝试加载本地
-            with open(self._cloud_files_json, 'r') as file:
-                content = file.read()
-                if content:
-                    self._cloud_files = json.loads(content)
-
-        __save_flag = False
-        # 遍历云盘目录
+        # 获取所有云盘文件集合
+        all_cloud_files = set()
+        dir_file_map = {}  # 存储每个目录对应的文件集合
+        
+        # 遍历云盘目录，收集所有文件
         for local_dir in self._cloud_dir_conf.keys():
-            # 云盘路径
             cloud_dir = self._cloud_dir_conf.get(local_dir)
-            # 本地strm路径
-            strm_dir = self._strm_dir_conf.get(local_dir)
-            # 格式化配置
-            format_str = self._format_conf.get(local_dir)
-            # 获取云盘树形结构
             tree_content = self.retrieve_directory_structure(cloud_dir)
             if not tree_content:
                 continue
-            # 遍历云盘树形结构文件
-            for cloud_file in self.parse_tree_structure(content=tree_content, dir_path=cloud_dir):
-                if Path(str(cloud_file)).is_dir():
-                    continue
-                # 本地挂载路径
-                local_file = str(cloud_file).replace(cloud_dir, local_dir)
-                # 本地strm路径
-                target_file = str(cloud_file).replace(cloud_dir, strm_dir)
+                
+            # 获取当前目录下的所有文件
+            current_files = set(
+                cloud_file
+                for cloud_file in self.parse_tree_structure(content=tree_content, dir_path=cloud_dir)
+                if Path(cloud_file).suffix
+            )
+            all_cloud_files.update(current_files)
+            dir_file_map[local_dir] = current_files
 
-                success_flag = False
+        # 使用集合差集找出新增文件
+        new_files = all_cloud_files - self._cloud_files
+        if not new_files:
+            logger.info("没有发现新的云盘文件需要处理")
+            if event:
+                self.post_message(
+                    channel=event.event_data.get("channel"),
+                    title="云盘Strm助手同步生成任务完成！(无新文件)",
+                    userid=event.event_data.get("user")
+                )
+            return
+
+        logger.info(f"发现 {len(new_files)} 个新文件需要处理")
+        
+        # 记录成功处理的文件
+        processed_files = set()  
+        has_changes = False
+
+        # 处理新增文件
+        for local_dir in self._cloud_dir_conf.keys():
+            cloud_dir = self._cloud_dir_conf.get(local_dir)
+            strm_dir = self._strm_dir_conf.get(local_dir)
+            format_str = self._format_conf.get(local_dir)
+            
+            # 获取当前目录需要处理的新文件
+            dir_new_files = new_files & dir_file_map[local_dir]
+            
+            for cloud_file in dir_new_files:
+                local_file = cloud_file.replace(cloud_dir, local_dir)
+                target_file = cloud_file.replace(cloud_dir, strm_dir)
+                
                 try:
-                    if str(cloud_file) not in self._cloud_files:
-                        logger.info(f"扫描到新文件 {cloud_file}，正在开始处理")
+                    success_flag = False
+                    file_suffix = Path(local_file).suffix.lower()
+                    
+                    # 处理媒体文件
+                    if file_suffix in self._rmt_mediaext_set:  # 预先定义为 set 的媒体扩展名
+                        strm_content = self.__format_content(
+                            format_str=format_str,
+                            local_file=local_file,
+                            cloud_file=cloud_file,
+                            uriencode=self._uriencode
+                        )
+                        success_flag = self.__create_strm_file(
+                            strm_file=target_file,
+                            strm_content=strm_content
+                        )
+                    # 处理非媒体文件
+                    elif self._copy_files and file_suffix in self._other_mediaext_set:  # 预先定义为 set 的非媒体扩展名
+                        os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                        shutil.copy2(local_file, target_file)
+                        logger.info(f"复制非媒体文件 {local_file} 到 {target_file}")
+                        success_flag = True
+                    # 处理字幕文件
+                    elif self._copy_subtitles and file_suffix in {'.srt', '.ass', '.ssa', '.sub'}:
+                        os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                        shutil.copy2(local_file, target_file)
+                        logger.info(f"复制字幕文件 {local_file} 到 {target_file}")
+                        success_flag = True
 
-                        # 只处理媒体文件
-                        if Path(local_file).suffix.lower() in [ext.strip() for ext in
-                                                               self._rmt_mediaext.split(",")]:
-                            # 生成strm文件内容
-                            strm_content = self.__format_content(format_str=format_str,
-                                                                 local_file=local_file,
-                                                                 cloud_file=str(cloud_file),
-                                                                 uriencode=self._uriencode)
-                            # 生成strm文件
-                            success_flag = self.__create_strm_file(strm_file=target_file,
-                                                                   strm_content=strm_content)
-                        else:
-                            # 复制非媒体文件
-                            if self._copy_files and self._other_mediaext and Path(local_file).suffix.lower() in [
-                                ext.strip() for ext in self._other_mediaext.split(",")]:
-                                os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                                shutil.copy2(str(local_file), target_file)
-                                logger.info(f"复制非媒体文件 {str(local_file)} 到 {target_file}")
+                    if success_flag:
+                        has_changes = True
+                        processed_files.add(cloud_file)
 
-                            # 复制字幕文件（独立于copy_files检查）
-                            if self._copy_subtitles and Path(local_file).suffix.lower() in ['.srt', '.ass', '.ssa',
-                                                                                            '.sub']:
-                                os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                                shutil.copy2(str(local_file), target_file)
-                                logger.info(f"复制字幕文件 {str(local_file)} 到 {target_file}")
-                            success_flag = True
-                    else:
-                        logger.info(f"{cloud_file} 已在缓存中！跳过处理")
                 except Exception as e:
                     logger.error(f"处理文件 {cloud_file} 失败：{str(e)}")
-                    success_flag = False
 
-                if success_flag:
-                    # 云盘文件json新增
-                    self._cloud_files.append(str(cloud_file))
-                    __save_flag = True
+        # 更新云盘文件集合并保存
+        if has_changes:
+            self._cloud_files = all_cloud_files
+            self.__save_json()
 
-            # 重新保存json文件
-            if __save_flag:
-                self.__sava_json()
+        # 计算并记录耗时
+        elapsed_time = time.time() - start_time
+        elapsed_time_str = None
+        if elapsed_time < 60:
+            elapsed_time_str = f"{elapsed_time:.2f} 秒"
+        else:
+            minutes = elapsed_time // 60
+            seconds = elapsed_time % 60
+            elapsed_time_str = f"{int(minutes)} 分 {seconds:.2f} 秒"        
+        logger.info(f"云盘Strm同步生成任务完成，共处理 {len(processed_files)} 个文件，耗时 {elapsed_time_str}")
 
-        logger.info("云盘Strm助手同步生成任务完成")
+
         if event:
-            self.post_message(channel=event.event_data.get("channel"),
-                              title="云盘Strm助手同步生成任务完成！",
-                              userid=event.event_data.get("user"))
+            self.post_message(
+                channel=event.event_data.get("channel"),
+                title="云盘Strm助手同步生成任务完成！",
+                userid=event.event_data.get("user")
+            )
 
     def event_handler(self, event, mon_path: str, text: str, event_path: str):
         """
@@ -420,64 +479,51 @@ class StrmGenerator(_PluginBase):
             self.__handle_file(event_path=event_path, mon_path=mon_path)
 
     def __handle_file(self, event_path: str, mon_path: str):
-        """
-        同步一个文件
-        :param event_path: 事件文件路径
-        :param mon_path: 监控目录
-        """
         try:
             if not Path(event_path).exists():
                 return
-            # 全程加锁
             with lock:
-                # 云盘路径
                 cloud_dir = self._cloud_dir_conf.get(mon_path)
-                # 本地strm路径
                 strm_dir = self._strm_dir_conf.get(mon_path)
-                # 格式化配置
                 format_str = self._format_conf.get(mon_path)
-                # 本地strm路径
                 target_file = str(event_path).replace(mon_path, strm_dir)
-                # 云盘文件路径
                 cloud_file = str(event_path).replace(mon_path, cloud_dir)
+                file_suffix = Path(event_path).suffix.lower()
 
-                # 只处理媒体文件
-                if Path(event_path).suffix.lower() in [ext.strip() for ext in
-                                                       self._rmt_mediaext.split(",")]:
-                    # 生成strm文件内容
-                    strm_content = self.__format_content(format_str=format_str,
-                                                         local_file=event_path,
-                                                         cloud_file=str(cloud_file),
-                                                         uriencode=self._uriencode)
-                    # 生成strm文件
-                    self.__create_strm_file(strm_file=target_file,
-                                            strm_content=strm_content)
-                else:
-                    # 复制非媒体文件
-                    if self._copy_files and self._other_mediaext and Path(event_path).suffix.lower() in [ext.strip() for
-                                                                                                         ext in
-                                                                                                         self._other_mediaext.split(
-                                                                                                             ",")]:
-                        os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                        shutil.copy2(str(event_path), target_file)
-                        logger.info(f"复制非媒体文件 {str(event_path)} 到 {target_file}")
+                success_flag = False
+                if file_suffix in self._rmt_mediaext_set:
+                    strm_content = self.__format_content(
+                        format_str=format_str,
+                        local_file=event_path,
+                        cloud_file=cloud_file,
+                        uriencode=self._uriencode
+                    )
+                    success_flag = self.__create_strm_file(strm_file=target_file, strm_content=strm_content)
+                    if success_flag:
+                        self._cloud_files.add(cloud_file)  # 更新缓存
+                elif self._copy_files and file_suffix in self._other_mediaext_set:
+                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                    shutil.copy2(event_path, target_file)
+                    logger.info(f"复制非媒体文件 {event_path} 到 {target_file}")
+                    success_flag = True
+                elif self._copy_subtitles and file_suffix in {'.srt', '.ass', '.ssa', '.sub'}:
+                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                    shutil.copy2(event_path, target_file)
+                    logger.info(f"复制字幕文件 {event_path} 到 {target_file}")
+                    success_flag = True
 
-                    # 复制字幕文件（独立于copy_files检查）
-                    if self._copy_subtitles and Path(event_path).suffix.lower() in ['.srt', '.ass', '.ssa', '.sub']:
-                        os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                        shutil.copy2(str(event_path), target_file)
-                        logger.info(f"复制字幕文件 {str(event_path)} 到 {target_file}")
+                if success_flag:
+                    self.__save_json()  # 保存更新后的缓存
         except Exception as e:
-            logger.error("目录监控发生错误：%s - %s" % (str(e), traceback.format_exc()))
+            logger.error(f"目录监控发生错误：{str(e)} - {traceback.format_exc()}")
 
-    def __sava_json(self):
-        """
-        保存json文件
-        """
-        logger.info(f"开始写入本地文件 {self._cloud_files_json}")
-        file = open(self._cloud_files_json, 'w')
-        file.write(json.dumps(self._cloud_files))
-        file.close()
+    def __save_json(self):
+        try:
+            logger.info(f"写入本地索引文件 {self._cloud_files_json}")
+            with open(self._cloud_files_json, 'w') as file:
+                json.dump(list(self._cloud_files), file)
+        except Exception as e:
+            logger.error(f"写入本地索引文件失败：{str(e)}")
 
     @staticmethod
     def __format_content(format_str: str, local_file: str, cloud_file: str, uriencode: bool):
@@ -506,18 +552,16 @@ class StrmGenerator(_PluginBase):
         :param dest_file:
         """
         try:
-            # 文件
+            # 创建目标文件夹
             if not Path(strm_file).parent.exists():
-                logger.info(f"创建目标文件夹 {Path(strm_file).parent}")
                 os.makedirs(Path(strm_file).parent)
 
             # 构造.strm文件路径
             strm_file = os.path.join(Path(strm_file).parent, f"{os.path.splitext(Path(strm_file).name)[0]}.strm")
 
-            # 媒体文件
+            # 目标文件若存在且不覆盖，则跳过
             if Path(strm_file).exists() and not self._cover:
-                logger.info(f"目标文件 {strm_file} 已存在")
-                return
+                return True
             # 新增：应用自定义路径替换规则
             for source, target in self._path_replacements.items():
                 if source in strm_content:
@@ -528,7 +572,6 @@ class StrmGenerator(_PluginBase):
             with open(strm_file, 'w', encoding='utf-8') as f:
                 f.write(strm_content)
 
-            logger.info(f"创建strm文件成功 {strm_file} -> {strm_content}")
             if self._url and Path(strm_content).suffix in settings.RMT_MEDIAEXT:
                 RequestUtils(content_type="application/json").post(
                     url=self._url,
@@ -646,6 +689,7 @@ class StrmGenerator(_PluginBase):
             if result.get("state"):
                 export_id = result.get("data", {}).get("export_id")
 
+                logger.info(f"等待目录树导出...")
                 retry_cnt = 60
                 while retry_cnt > 0:
                     response = requests.get(url=export_api,
@@ -657,8 +701,7 @@ class StrmGenerator(_PluginBase):
                             if str(export_id) == str(result.get("data", {}).get("export_id")):
                                 return result.get("data", {}).get("pick_code"), result.get("data", {}).get("file_id")
                     retry_cnt -= 1
-                    logger.info(f"等待目录树生成完成，剩余轮询 {retry_cnt} 次")
-                    time.sleep(3)
+                    time.sleep(5)
         return None
     
     def fs_dir_getid(self, path):
