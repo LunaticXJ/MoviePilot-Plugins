@@ -63,7 +63,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "1.4"
+    plugin_version = "2.1"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
