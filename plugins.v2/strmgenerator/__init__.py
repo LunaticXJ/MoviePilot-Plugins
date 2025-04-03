@@ -63,7 +63,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "2.0"
+    plugin_version = "1.4"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -202,11 +202,15 @@ class StrmGenerator(_PluginBase):
 
         if self._enabled or self._onlyonce:
             # 定时服务
-            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            if not self._scheduler:
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            # 检查现有任务，避免重复添加
+            existing_jobs = self._scheduler.get_jobs()
+            job_names = [job.name for job in existing_jobs]
+            logger.info(f"当前存在调度任务: {job_names}")
 
-            if self._notify:
-                # 追加入库消息统一发送服务
-                self._scheduler.add_job(self.send_msg, trigger='interval', seconds=15)
+            if self._notify and "发送消息" not in job_names:
+                self._scheduler.add_job(self.send_msg, trigger='interval', seconds=15, name="发送消息")
 
             # 读取目录配置
             monitor_confs = self._monitor_confs.split("\n")
@@ -277,30 +281,27 @@ class StrmGenerator(_PluginBase):
 
             # 运行一次定时服务
             if self._onlyonce:
-                logger.info("云盘Strm助手全量执行服务启动，立即运行一次")
-                self._scheduler.add_job(func=self.scan, trigger='date',
-                                        run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                        name="云盘Strm助手全量执行")
+                logger.info("添加Strm同步一次性任务")
+                self._scheduler.add_job(func=self.scan, trigger='date', run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3))
+
                 # 关闭一次性开关
                 self._onlyonce = False
                 # 保存配置
                 self.__update_config()
 
-            # 周期运行
-            if self._cron:
-                try:
-                    self._scheduler.add_job(func=self.scan,
-                                            trigger=CronTrigger.from_crontab(self._cron),
-                                            name="云盘Strm助手同步")
-                except Exception as err:
-                    logger.error(f"定时任务配置错误：{err}")
-                    # 推送实时消息
-                    self.systemmessage.put(f"执行周期配置错误：{err}")
+            # 可能会与MP框架注册的服务重复
+            # if self._cron:
+            #     try:
+            #         self._scheduler.add_job(func=self.scan, trigger=CronTrigger.from_crontab(self._cron))
+            #         logger.info(f"添加Strm同步定时任务: {self._cron}")
+            #     except Exception as err:
+            #         logger.error(f"定时任务配置错误：{err}")
+            #         self.systemmessage.put(f"执行周期配置错误：{err}")
 
             # 启动任务
-            if self._scheduler.get_jobs():
-                self._scheduler.print_jobs()
+            if self._scheduler.get_jobs() and not self._scheduler.running:
                 self._scheduler.start()
+                logger.info("调度器启动")
 
     @eventmanager.register(EventType.PluginAction)
     def strm_one(self, event: Event = None):
@@ -332,9 +333,9 @@ class StrmGenerator(_PluginBase):
         """
         云盘全量扫描
         """
+        
         # 记录开始时间
         start_time = time.time()
-
         if not self._strm_dir_conf or not self._strm_dir_conf.keys():
             logger.error("未获取到可用目录监控配置，请检查")
             return
@@ -776,7 +777,7 @@ class StrmGenerator(_PluginBase):
                 return
             pick_code, file_id = self.export_dir(dir_id)
             if not pick_code:
-                logger.error(f"{directory_path} 生成目录数失败")
+                logger.error(f"{directory_path} 生成目录树失败")
                 return
             # 获取目录树下载链接
             download_url = self.download_url(pick_code)
@@ -1660,22 +1661,26 @@ class StrmGenerator(_PluginBase):
     def get_page(self) -> List[dict]:
         pass
 
-    def stop_service(self):
-        """
-        退出插件
-        """
-        if self._observer:
-            for observer in self._observer:
-                try:
-                    observer.stop()
-                    observer.join()
-                except Exception as e:
-                    print(str(e))
+def stop_service(self):
+    if self._observer:
+        for observer in self._observer:
+            try:
+                observer.stop()
+                observer.join()
+            except Exception as e:
+                logger.error(f"停止观察者失败: {str(e)}")
         self._observer = []
-        if self._scheduler:
+
+    if self._scheduler:
+        try:
             self._scheduler.remove_all_jobs()
             if self._scheduler.running:
                 self._event.set()
-                self._scheduler.shutdown()
+                self._scheduler.shutdown(wait=True)  # 等待线程结束
                 self._event.clear()
+            else:
+                logger.info("调度器未运行，无需关闭")
+        except Exception as e:
+            logger.error(f"停止调度器失败: {str(e)}")
+        finally:
             self._scheduler = None
