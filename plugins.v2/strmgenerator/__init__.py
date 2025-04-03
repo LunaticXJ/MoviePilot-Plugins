@@ -63,7 +63,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png"
     # 插件版本
-    plugin_version = "2.1"
+    plugin_version = "3.0.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -1661,26 +1661,26 @@ class StrmGenerator(_PluginBase):
     def get_page(self) -> List[dict]:
         pass
 
-def stop_service(self):
-    if self._observer:
-        for observer in self._observer:
-            try:
-                observer.stop()
-                observer.join()
-            except Exception as e:
-                logger.error(f"停止观察者失败: {str(e)}")
-        self._observer = []
+    def stop_service(self):
+        if self._observer:
+            for observer in self._observer:
+                try:
+                    observer.stop()
+                    observer.join()
+                except Exception as e:
+                    logger.error(f"停止观察者失败: {str(e)}")
+            self._observer = []
 
-    if self._scheduler:
-        try:
-            self._scheduler.remove_all_jobs()
-            if self._scheduler.running:
-                self._event.set()
-                self._scheduler.shutdown(wait=True)  # 等待线程结束
-                self._event.clear()
-            else:
-                logger.info("调度器未运行，无需关闭")
-        except Exception as e:
-            logger.error(f"停止调度器失败: {str(e)}")
-        finally:
-            self._scheduler = None
+        if self._scheduler:
+            try:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._event.set()
+                    self._scheduler.shutdown(wait=True)  # 等待线程结束
+                    self._event.clear()
+                else:
+                    logger.info("调度器未运行，无需关闭")
+            except Exception as e:
+                logger.error(f"停止调度器失败: {str(e)}")
+            finally:
+                self._scheduler = None
