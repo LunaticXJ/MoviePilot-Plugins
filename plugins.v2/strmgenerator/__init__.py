@@ -17,9 +17,6 @@ import pytz
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from urllib.parse import quote
-from watchdog.observers.polling import PollingObserver
-
 from app.core.config import settings
 from app.core.event import eventmanager, Event
 from app.core.metainfo import MetaInfoPath
@@ -27,9 +24,7 @@ from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import MediaInfo
-from app.schemas.file import FileItem
 from app.schemas.types import EventType, NotificationType, MediaType
-from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
 CRE_SET_COOKIE: Final = re_compile(r"[0-9a-f]{32}=[0-9a-f]{32}.*")
@@ -38,11 +33,9 @@ lock = threading.Lock()
 
 class StrmGenerator(_PluginBase):
     # 插件名称
-    plugin_name = "115云盘Strm生成器"
+    plugin_name = "115云盘Strm助手"
     # 插件描述
-    plugin_desc = (
-        "115云盘Strm生成器，可基于目录树全量定时生成和基于整理事件增量实时生成。"
-    )
+    plugin_desc = "115云盘全量快速生成工具，并可实时MP新整理入库的文件。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png"
     # 插件版本
@@ -98,12 +91,8 @@ class StrmGenerator(_PluginBase):
     _event = threading.Event()
 
     def __init__(self):
-        """
-        构造方法，初始化基本属性和扩展名集合
-        """
         super().__init__()  # 调用父类 _PluginBase 的构造方法
 
-        # 设置默认的媒体扩展名（如果未在配置中指定）
         if not self._rmt_mediaext:
             self._rmt_mediaext = ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v"
 
@@ -118,11 +107,10 @@ class StrmGenerator(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         logger.debug(f"初始化插件 {self.plugin_name}")
-        # 清空配置
         self._strm_dir_conf = {}
         self._cloud_dir_conf = {}
         self._format_conf = {}
-        self._path_replacements = {}  # 新增：清空路径替换规则
+        self._path_replacements = {}
         self._cloud_files_json = os.path.join(
             self.get_data_path(), self._cloud_files_json
         )
