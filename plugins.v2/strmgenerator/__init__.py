@@ -18,7 +18,6 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from urllib.parse import quote
-from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
 
 from app.core.config import settings
@@ -28,6 +27,7 @@ from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import MediaInfo
+from app.schemas.file import FileItem
 from app.schemas.types import EventType, NotificationType, MediaType
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
@@ -36,34 +36,17 @@ CRE_SET_COOKIE: Final = re_compile(r"[0-9a-f]{32}=[0-9a-f]{32}.*")
 lock = threading.Lock()
 
 
-class FileMonitorHandler(FileSystemEventHandler):
-    """
-    目录监控响应类
-    """
-
-    def __init__(self, monpath: str, sync: Any, **kwargs):
-        super(FileMonitorHandler, self).__init__(**kwargs)
-        self._watch_path = monpath
-        self.sync = sync
-
-    def on_created(self, event):
-        self.sync.event_handler(event=event, text="创建",
-                                mon_path=self._watch_path, event_path=event.src_path)
-
-    def on_moved(self, event):
-        self.sync.event_handler(event=event, text="移动",
-                                mon_path=self._watch_path, event_path=event.dest_path)
-
-
 class StrmGenerator(_PluginBase):
     # 插件名称
-    plugin_name = "Strm生成器"
+    plugin_name = "115云盘Strm生成器"
     # 插件描述
-    plugin_desc = "实时/定时监控生成strm文件"
+    plugin_desc = (
+        "115云盘Strm生成器，可基于目录树全量定时生成和基于整理事件增量实时生成。"
+    )
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png"
+    plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.0.1"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -85,32 +68,27 @@ class StrmGenerator(_PluginBase):
     _monitor = False
     _copy_files = False
     _copy_subtitles = False
-    _url = None
     _notify = False
-    _refresh_emby = False
     _uriencode = False
     _strm_dir_conf = {}
     _cloud_dir_conf = {}
-    _category_conf = {}
     _format_conf = {}
     _cloud_files = set()
-    _observer = []
+    _dirty = False  # _cloud_files是否有未写入json文件的脏数据
     _medias = {}
     _rmt_mediaext = None
     _other_mediaext = None
     _115_cookie = None
-    _interval: int = 10
     _mediaservers = None
     mediaserver_helper = None
-    _emby_paths = {}
-    _path_replacements = {} # 新增：路径替换规则属性
+    _path_replacements = {}  # Strm文件内容的路径替换规则
     _cloud_files_json = "cloud_files.json"
     _headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 11_2_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.192 Safari/537.36",
         "Cookie": "",
     }
 
-    # 新增：预计算的扩展名集合
+    # 扩展名集合
     _rmt_mediaext_set = set()
     _other_mediaext_set = set()
 
@@ -119,30 +97,35 @@ class StrmGenerator(_PluginBase):
     # 退出事件
     _event = threading.Event()
 
-
     def __init__(self):
         """
         构造方法，初始化基本属性和扩展名集合
         """
         super().__init__()  # 调用父类 _PluginBase 的构造方法
-        
+
         # 设置默认的媒体扩展名（如果未在配置中指定）
         if not self._rmt_mediaext:
             self._rmt_mediaext = ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v"
-        
-        # 预先将扩展名转换为 set，提高查找效率
-        self._rmt_mediaext_set = {ext.strip().lower() for ext in self._rmt_mediaext.split(",")}
-        self._other_mediaext_set = {ext.strip().lower() for ext in (self._other_mediaext or "").split(",") if ext.strip()}
+
+        self._rmt_mediaext_set = {
+            ext.strip().lower() for ext in self._rmt_mediaext.split(",")
+        }
+        self._other_mediaext_set = {
+            ext.strip().lower()
+            for ext in (self._other_mediaext or "").split(",")
+            if ext.strip()
+        }
 
     def init_plugin(self, config: dict = None):
-        logger.debug(f"初始化插件 {self.plugin_name}")  # 添加调试日志
+        logger.debug(f"初始化插件 {self.plugin_name}")
         # 清空配置
         self._strm_dir_conf = {}
         self._cloud_dir_conf = {}
         self._format_conf = {}
-        self._category_conf = {}
-        self._path_replacements = {}  # 新增：清空路径替换规则        
-        self._cloud_files_json = os.path.join(self.get_data_path(), self._cloud_files_json)
+        self._path_replacements = {}  # 新增：清空路径替换规则
+        self._cloud_files_json = os.path.join(
+            self.get_data_path(), self._cloud_files_json
+        )
         self.mediaserver_helper = MediaServerHelper()
 
         if config:
@@ -150,38 +133,37 @@ class StrmGenerator(_PluginBase):
             self._cron = config.get("cron")
             self._onlyonce = config.get("onlyonce")
             self._rebuild = config.get("rebuild")
-            self._interval = config.get("interval") or 10
             self._monitor = config.get("monitor")
             self._cover = config.get("cover")
             self._copy_files = config.get("copy_files")
             self._copy_subtitles = config.get("copy_subtitles")
-            self._refresh_emby = config.get("refresh_emby")
             self._notify = config.get("notify")
             self._uriencode = config.get("uriencode")
             self._monitor_confs = config.get("monitor_confs")
-            self._url = config.get("url")
             self._mediaservers = config.get("mediaservers") or []
             self._other_mediaext = config.get("other_mediaext")
-
             self._rmt_mediaext = config.get("rmt_mediaext") or self._rmt_mediaext
-            # 更新扩展名集合
-            self._rmt_mediaext_set = {ext.strip().lower() for ext in self._rmt_mediaext.split(",")}
-            self._other_mediaext_set = {ext.strip().lower() for ext in (self._other_mediaext or "").split(",") if ext.strip()}
-            
-            # 读取路径替换规则
+            self._rmt_mediaext_set = {
+                ext.strip().lower() for ext in self._rmt_mediaext.split(",")
+            }
+            self._other_mediaext_set = {
+                ext.strip().lower()
+                for ext in (self._other_mediaext or "").split(",")
+                if ext.strip()
+            }
             if config.get("path_replacements"):
                 for replacement in str(config.get("path_replacements")).split("\n"):
                     if replacement and ":" in replacement:
                         source, target = replacement.split(":", 1)
                         self._path_replacements[source.strip()] = target.strip()
-
             self._115_cookie = config.get("115_cookie")
             if self._115_cookie:
                 self._headers["Cookie"] = self._115_cookie
-            if config.get("emby_path"):
-                for path in str(config.get("emby_path")).split(","):
-                    self._emby_paths[path.split(":")[0]] = path.split(":")[1]
 
+        # 停止现有任务
+        self.stop_service()
+
+        # 清理索引，可单独执行（不依赖启用或全量运行一次开关）
         if self._rebuild:
             logger.info("开始清理文件索引")
             self._rebuild = False
@@ -192,46 +174,46 @@ class StrmGenerator(_PluginBase):
             self.__update_config()
         elif Path(self._cloud_files_json).exists():
             logger.info("加载文件索引")
-            with open(self._cloud_files_json, 'r') as file:
+            with open(self._cloud_files_json, "r") as file:
                 content = file.read()
                 if content:
                     self._cloud_files = set(json.loads(content))
 
-        # 停止现有任务
-        self.stop_service()
-
+        # 当插件的启用或全量运行一次开关打开时
         if self._enabled or self._onlyonce:
-            # 定时服务
+            # 初始化调度器
             if not self._scheduler:
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            # 检查现有任务，避免重复添加
+
+            # 查看是否存在已有任务
             existing_jobs = self._scheduler.get_jobs()
             job_names = [job.name for job in existing_jobs]
             logger.info(f"当前存在调度任务: {job_names}")
 
+            # 添加定时保存JSON文件任务
+            if "保存JSON文件" not in job_names:
+                self._scheduler.add_job(
+                    self.__save_json_if_dirty,
+                    trigger="interval",
+                    seconds=30,
+                    name="保存JSON文件",
+                )
+            # 添加定时发送消息任务
             if self._notify and "发送消息" not in job_names:
-                self._scheduler.add_job(self.send_msg, trigger='interval', seconds=15, name="发送消息")
+                self._scheduler.add_job(
+                    self.send_msg, trigger="interval", seconds=15, name="发送消息"
+                )
 
-            # 读取目录配置
+            # 读取目录配置，每行格式：MP中云盘挂载本地的路径#MoviePilot中strm生成路径#alist/cd2上115路径#strm格式化
             monitor_confs = self._monitor_confs.split("\n")
             if not monitor_confs:
                 return
             for monitor_conf in monitor_confs:
-                # 格式 MoviePilot中云盘挂载本地的路径#MoviePilot中strm生成路径#alist/cd2上115路径#strm格式化
-                if not monitor_conf:
-                    continue
-                # 注释
-                if str(monitor_conf).startswith("#"):
+                # 忽略空行和注释行
+                if not monitor_conf or str(monitor_conf).startswith("#"):
                     continue
 
-                monitor = None
-                if monitor_conf.count("$") == 1:
-                    monitor = str(monitor_conf.split("$")[1])
-                    monitor_conf = monitor_conf.split("$")[0]
-                category = None
-                if monitor_conf.count("@") == 1:
-                    category = str(monitor_conf.split("@")[1])
-                    monitor_conf = monitor_conf.split("@")[0]
+                # 处理配置
                 if str(monitor_conf).count("#") == 3:
                     local_dir = str(monitor_conf).split("#")[0]
                     strm_dir = str(monitor_conf).split("#")[1]
@@ -244,76 +226,39 @@ class StrmGenerator(_PluginBase):
                 self._strm_dir_conf[local_dir] = strm_dir
                 self._cloud_dir_conf[local_dir] = cloud_dir
                 self._format_conf[local_dir] = format_str
-                self._category_conf[local_dir] = category
-                # 检查媒体库目录是不是下载目录的子目录
-                try:
-                    if strm_dir and Path(strm_dir).is_relative_to(Path(local_dir)):
-                        logger.warn(f"{strm_dir} 是 {local_dir} 的子目录，无法监控")
-                        self.systemmessage.put(f"{strm_dir} 是 {local_dir} 的子目录，无法监控")
-                        continue
-                except Exception as e:
-                    logger.debug(str(e))
-                    pass
-
-                if not monitor:
-                    try:
-                        if self._monitor:
-                            # 兼容模式，目录同步性能降低且NAS不能休眠，但可以兼容挂载的远程共享目录如SMB
-                            observer = PollingObserver(timeout=10)
-                            self._observer.append(observer)
-                            observer.schedule(FileMonitorHandler(local_dir, self), path=local_dir, recursive=True)
-                            observer.daemon = True
-                            observer.start()
-                            logger.info(f"{local_dir} 的Strm生成实时监控服务启动")
-                    except Exception as e:
-                        err_msg = str(e)
-                        if "inotify" in err_msg and "reached" in err_msg:
-                            logger.warn(
-                                f"云盘实时监控服务启动出现异常：{err_msg}，请在宿主机上（不是docker容器内）执行以下命令并重启："
-                                + """
-                                                        echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf
-                                                        echo fs.inotify.max_user_instances=524288 | sudo tee -a /etc/sysctl.conf
-                                                        sudo sysctl -p
-                                                        """)
-                        else:
-                            logger.error(f"{local_dir} 启动x实时监控失败：{err_msg}")
-                        self.systemmessage.put(f"{local_dir} 启动实时监控失败：{err_msg}")
 
             # 运行一次定时服务
             if self._onlyonce:
-                logger.info("添加Strm同步一次性任务")
-                self._scheduler.add_job(func=self.scan, trigger='date', run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3))
+                logger.info("添加Strm全量扫描一次性任务")
+                self._scheduler.add_job(
+                    func=self.full_scan,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ))
+                    + timedelta(seconds=3),
+                )
 
                 # 关闭一次性开关
                 self._onlyonce = False
                 # 保存配置
                 self.__update_config()
 
-            # 可能会与MP框架注册的服务重复
-            # if self._cron:
-            #     try:
-            #         self._scheduler.add_job(func=self.scan, trigger=CronTrigger.from_crontab(self._cron))
-            #         logger.info(f"添加Strm同步定时任务: {self._cron}")
-            #     except Exception as err:
-            #         logger.error(f"定时任务配置错误：{err}")
-            #         self.systemmessage.put(f"执行周期配置错误：{err}")
-
             # 启动任务
             if self._scheduler.get_jobs() and not self._scheduler.running:
                 self._scheduler.start()
                 logger.info("调度器启动")
 
-    @eventmanager.register(EventType.PluginAction)
+    # 实时监控MP整理事件，增量生成strm文件
+    @eventmanager.register(EventType.TransferComplete)
     def strm_one(self, event: Event = None):
-        if event:
+        if event and self._monitor:
             event_data = event.event_data
-            if not event_data or event_data.get("action") != "cloudstrm_file":
-                return
-            file_path = event_data.get("file_path")
+            file_path = event_data["transferinfo"].file_list_new[0]
             if not file_path:
-                logger.error(f"缺少参数：{event_data}")
+                logger.error(
+                    f"收到文件整理完成事件，获取文件路径参数失败：{event_data}"
+                )
                 return
-
+            logger.info(f"收到文件整理完成事件，文件路径：{file_path}")
             # 遍历所有监控目录
             mon_path = None
             for mon in self._strm_dir_conf.keys():
@@ -329,11 +274,7 @@ class StrmGenerator(_PluginBase):
             self.__handle_file(event_path=file_path, mon_path=mon_path)
 
     @eventmanager.register(EventType.PluginAction)
-    def scan(self, event: Event = None):
-        """
-        云盘全量扫描
-        """
-        
+    def full_scan(self, event: Event = None):
         # 记录开始时间
         start_time = time.time()
         if not self._strm_dir_conf or not self._strm_dir_conf.keys():
@@ -348,25 +289,29 @@ class StrmGenerator(_PluginBase):
             if not event_data or event_data.get("action") != "StrmGenerator":
                 return
             logger.info("收到命令，开始云盘Strm生成 ...")
-            self.post_message(channel=event.event_data.get("channel"),
-                              title="开始云盘Strm生成 ...",
-                              userid=event.event_data.get("user"))
+            self.post_message(
+                channel=event.event_data.get("channel"),
+                title="开始云盘Strm生成 ...",
+                userid=event.event_data.get("user"),
+            )
         logger.info("云盘Strm同步生成任务开始")
         # 获取所有云盘文件集合
         all_cloud_files = set()
         dir_file_map = {}  # 存储每个目录对应的文件集合
-        
+
         # 遍历云盘目录，收集所有文件
         for local_dir in self._cloud_dir_conf.keys():
             cloud_dir = self._cloud_dir_conf.get(local_dir)
             tree_content = self.retrieve_directory_structure(cloud_dir)
             if not tree_content:
                 continue
-                
+
             # 获取当前目录下的所有文件
             current_files = set(
                 cloud_file
-                for cloud_file in self.parse_tree_structure(content=tree_content, dir_path=cloud_dir)
+                for cloud_file in self.parse_tree_structure(
+                    content=tree_content, dir_path=cloud_dir
+                )
                 if Path(cloud_file).suffix
             )
             all_cloud_files.update(current_files)
@@ -380,14 +325,14 @@ class StrmGenerator(_PluginBase):
                 self.post_message(
                     channel=event.event_data.get("channel"),
                     title="云盘Strm助手同步生成任务完成！(无新文件)",
-                    userid=event.event_data.get("user")
+                    userid=event.event_data.get("user"),
                 )
             return
 
         logger.info(f"发现 {len(new_files)} 个新文件需要处理")
-        
+
         # 记录成功处理的文件
-        processed_files = set()  
+        processed_files = set()
         has_changes = False
 
         # 处理新增文件
@@ -395,38 +340,46 @@ class StrmGenerator(_PluginBase):
             cloud_dir = self._cloud_dir_conf.get(local_dir)
             strm_dir = self._strm_dir_conf.get(local_dir)
             format_str = self._format_conf.get(local_dir)
-            
+
             # 获取当前目录需要处理的新文件
             dir_new_files = new_files & dir_file_map[local_dir]
-            
+
             for cloud_file in dir_new_files:
                 local_file = cloud_file.replace(cloud_dir, local_dir)
                 target_file = cloud_file.replace(cloud_dir, strm_dir)
-                
+
                 try:
                     success_flag = False
                     file_suffix = Path(local_file).suffix.lower()
-                    
+
                     # 处理媒体文件
-                    if file_suffix in self._rmt_mediaext_set:  # 预先定义为 set 的媒体扩展名
+                    if (
+                        file_suffix in self._rmt_mediaext_set
+                    ):  # 预先定义为 set 的媒体扩展名
                         strm_content = self.__format_content(
                             format_str=format_str,
                             local_file=local_file,
                             cloud_file=cloud_file,
-                            uriencode=self._uriencode
+                            uriencode=self._uriencode,
                         )
                         success_flag = self.__create_strm_file(
-                            strm_file=target_file,
-                            strm_content=strm_content
+                            strm_file=target_file, strm_content=strm_content
                         )
                     # 处理非媒体文件
-                    elif self._copy_files and file_suffix in self._other_mediaext_set:  # 预先定义为 set 的非媒体扩展名
+                    elif (
+                        self._copy_files and file_suffix in self._other_mediaext_set
+                    ):  # 预先定义为 set 的非媒体扩展名
                         os.makedirs(os.path.dirname(target_file), exist_ok=True)
                         shutil.copy2(local_file, target_file)
                         logger.info(f"复制非媒体文件 {local_file} 到 {target_file}")
                         success_flag = True
                     # 处理字幕文件
-                    elif self._copy_subtitles and file_suffix in {'.srt', '.ass', '.ssa', '.sub'}:
+                    elif self._copy_subtitles and file_suffix in {
+                        ".srt",
+                        ".ass",
+                        ".ssa",
+                        ".sub",
+                    }:
                         os.makedirs(os.path.dirname(target_file), exist_ok=True)
                         shutil.copy2(local_file, target_file)
                         logger.info(f"复制字幕文件 {local_file} 到 {target_file}")
@@ -442,7 +395,8 @@ class StrmGenerator(_PluginBase):
         # 更新云盘文件集合并保存
         if has_changes:
             self._cloud_files = all_cloud_files
-            self.__save_json()
+            self._dirty = True  # 标记为脏数据
+            self.__save_json_if_dirty()
 
         # 计算并记录耗时
         elapsed_time = time.time() - start_time
@@ -452,82 +406,72 @@ class StrmGenerator(_PluginBase):
         else:
             minutes = elapsed_time // 60
             seconds = elapsed_time % 60
-            elapsed_time_str = f"{int(minutes)} 分 {seconds:.2f} 秒"        
-        logger.info(f"云盘Strm同步生成任务完成，共处理 {len(processed_files)} 个文件，耗时 {elapsed_time_str}")
-
+            elapsed_time_str = f"{int(minutes)} 分 {seconds:.2f} 秒"
+        logger.info(
+            f"云盘Strm同步生成任务完成，共处理 {len(processed_files)} 个文件，耗时 {elapsed_time_str}"
+        )
 
         if event:
             self.post_message(
                 channel=event.event_data.get("channel"),
                 title="云盘Strm助手同步生成任务完成！",
-                userid=event.event_data.get("user")
+                userid=event.event_data.get("user"),
             )
 
-    def event_handler(self, event, mon_path: str, text: str, event_path: str):
-        """
-        处理文件变化
-        :param event: 事件
-        :param mon_path: 监控目录
-        :param text: 事件描述
-        :param event_path: 事件文件路径
-        """
-        if not event.is_directory:
-            if '.fuse_hidden' in event_path:
-                return
-
-            # 文件发生变化
-            logger.debug("监控到文件%s：%s" % (text, event_path))
-            self.__handle_file(event_path=event_path, mon_path=mon_path)
-
     def __handle_file(self, event_path: str, mon_path: str):
-        try:
-            if not Path(event_path).exists():
-                return
-            with lock:
-                cloud_dir = self._cloud_dir_conf.get(mon_path)
-                strm_dir = self._strm_dir_conf.get(mon_path)
-                format_str = self._format_conf.get(mon_path)
-                target_file = str(event_path).replace(mon_path, strm_dir)
-                cloud_file = str(event_path).replace(mon_path, cloud_dir)
-                file_suffix = Path(event_path).suffix.lower()
 
-                success_flag = False
-                if file_suffix in self._rmt_mediaext_set:
-                    strm_content = self.__format_content(
-                        format_str=format_str,
-                        local_file=event_path,
-                        cloud_file=cloud_file,
-                        uriencode=self._uriencode
-                    )
-                    success_flag = self.__create_strm_file(strm_file=target_file, strm_content=strm_content)
-                    if success_flag:
+        cloud_dir = self._cloud_dir_conf.get(mon_path)
+        strm_dir = self._strm_dir_conf.get(mon_path)
+        format_str = self._format_conf.get(mon_path)
+        target_file = str(event_path).replace(mon_path, strm_dir)
+        cloud_file = str(event_path).replace(mon_path, cloud_dir)
+        file_suffix = Path(event_path).suffix.lower()
+
+        try:
+            if file_suffix in self._rmt_mediaext_set:
+                strm_content = self.__format_content(
+                    format_str=format_str,
+                    local_file=event_path,
+                    cloud_file=cloud_file,
+                    uriencode=self._uriencode,
+                )
+                if self.__create_strm_file(
+                    strm_file=target_file, strm_content=strm_content
+                ):
+                    with lock:
                         self._cloud_files.add(cloud_file)  # 更新缓存
-                elif self._copy_files and file_suffix in self._other_mediaext_set:
-                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                    shutil.copy2(event_path, target_file)
-                    logger.info(f"复制非媒体文件 {event_path} 到 {target_file}")
-                    success_flag = True
-                elif self._copy_subtitles and file_suffix in {'.srt', '.ass', '.ssa', '.sub'}:
-                    os.makedirs(os.path.dirname(target_file), exist_ok=True)
-                    shutil.copy2(event_path, target_file)
-                    logger.info(f"复制字幕文件 {event_path} 到 {target_file}")
-                    success_flag = True
-
-                if success_flag:
-                    self.__save_json()  # 保存更新后的缓存
+                        self._dirty = True  # 标记为脏数据
+            elif self._copy_files and file_suffix in self._other_mediaext_set:
+                os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                shutil.copy2(event_path, target_file)
+                logger.info(f"复制非媒体文件 {event_path} 到 {target_file}")
+            elif self._copy_subtitles and file_suffix in {
+                ".srt",
+                ".ass",
+                ".ssa",
+                ".sub",
+            }:
+                os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                shutil.copy2(event_path, target_file)
+                logger.info(f"复制字幕文件 {event_path} 到 {target_file}")
         except Exception as e:
-            logger.error(f"目录监控发生错误：{str(e)} - {traceback.format_exc()}")
+            logger.error(f"处理单个文件出错：{str(e)} - {traceback.format_exc()}")
 
-    def __save_json(self):
-        try:
-            logger.info(f"写入本地索引文件 {self._cloud_files_json}")
-            with open(self._cloud_files_json, 'w') as file:
-                json.dump(list(self._cloud_files), file)
-        except Exception as e:
-            logger.error(f"写入本地索引文件失败：{str(e)}")
+    def __save_json_if_dirty(self):
+        with lock:
+            if self._dirty:
+                try:
+                    logger.info(f"写入本地索引文件 {self._cloud_files_json}")
+                    with open(self._cloud_files_json, "w") as file:
+                        json.dump(list(self._cloud_files), file)
+                    self._dirty = False
+                except Exception as e:
+                    logger.error(f"写入本地索引文件失败：{str(e)}")
 
     @staticmethod
-    def __format_content(format_str: str, local_file: str, cloud_file: str, uriencode: bool):
+    def __format_content(
+        format_str: str, local_file: str, cloud_file: str, uriencode: bool
+    ):
         """
         格式化strm内容
         """
@@ -536,7 +480,7 @@ class StrmGenerator(_PluginBase):
         elif "{cloud_file}" in format_str:
             if uriencode:
                 # 对盘符之后的所有内容进行url转码
-                cloud_file = urllib.parse.quote(cloud_file, safe='')
+                cloud_file = urllib.parse.quote(cloud_file, safe="")
             else:
                 # 替换路径中的\为/
                 cloud_file = cloud_file.replace("\\", "/")
@@ -545,23 +489,20 @@ class StrmGenerator(_PluginBase):
             return None
 
     def __create_strm_file(self, strm_file: str, strm_content: str):
-
-        """
-        生成strm文件
-        :param library_dir:
-        :param dest_dir:
-        :param dest_file:
-        """
         try:
             # 创建目标文件夹
             if not Path(strm_file).parent.exists():
                 os.makedirs(Path(strm_file).parent)
 
             # 构造.strm文件路径
-            strm_file = os.path.join(Path(strm_file).parent, f"{os.path.splitext(Path(strm_file).name)[0]}.strm")
+            strm_file = os.path.join(
+                Path(strm_file).parent,
+                f"{os.path.splitext(Path(strm_file).name)[0]}.strm",
+            )
 
             # 目标文件若存在且不覆盖，则跳过
             if Path(strm_file).exists() and not self._cover:
+                logger.info(f"目标strm文件已存在，跳过: {strm_file} ")
                 return True
             # 新增：应用自定义路径替换规则
             for source, target in self._path_replacements.items():
@@ -570,20 +511,15 @@ class StrmGenerator(_PluginBase):
                     logger.debug(f"应用路径替换规则: {source} -> {target}")
 
             # 写入.strm文件
-            with open(strm_file, 'w', encoding='utf-8') as f:
+            with open(strm_file, "w", encoding="utf-8") as f:
                 f.write(strm_content)
-
-            if self._url and Path(strm_content).suffix in settings.RMT_MEDIAEXT:
-                RequestUtils(content_type="application/json").post(
-                    url=self._url,
-                    json={"path": str(strm_content), "type": "add"},
-                )
+            logger.info(f"创建strm文件成功: {strm_file}")
 
             if self._notify and Path(strm_content).suffix in settings.RMT_MEDIAEXT:
                 # 发送消息汇总
                 file_meta = MetaInfoPath(Path(strm_file))
 
-                pattern = r'tmdbid=(\d+)'
+                pattern = r"tmdbid=(\d+)"
                 # 提取 tmdbid
                 match = re.search(pattern, strm_file)
                 if match:
@@ -604,87 +540,36 @@ class StrmGenerator(_PluginBase):
                         "episodes": episodes,
                         "file_meta": file_meta,
                         "type": "tv" if file_meta.season else "movie",
-                        "time": datetime.now()
+                        "time": datetime.now(),
                     }
                 else:
                     media_list = {
-                        "episodes": [int(file_meta.begin_episode)] if file_meta.begin_episode else [],
+                        "episodes": (
+                            [int(file_meta.begin_episode)]
+                            if file_meta.begin_episode
+                            else []
+                        ),
                         "file_meta": file_meta,
                         "type": "tv" if file_meta.season else "movie",
-                        "time": datetime.now()
+                        "time": datetime.now(),
                     }
                 self._medias[key] = media_list
 
-            # 通知emby刷新
-            if self._refresh_emby and self._mediaservers:
-                time.sleep(0.1)
-                self.__refresh_emby_file(strm_file)
             return True
         except Exception as e:
             logger.error(f"创建strm文件失败 {strm_file} -> {str(e)}")
         return False
-
-    def __refresh_emby_file(self, strm_file: str):
-        """
-        通知emby刷新文件
-        """
-        emby_servers = self.mediaserver_helper.get_services(name_filters=self._mediaservers, type_filter="emby")
-        if not emby_servers:
-            logger.error("未配置Emby媒体服务器")
-            return
-
-        strm_file = self.__get_path(paths=self._emby_paths, file_path=strm_file)
-        for emby_name, emby_server in emby_servers.items():
-            emby = emby_server.instance
-            self._EMBY_USER = emby_server.instance.get_user()
-            self._EMBY_APIKEY = emby_server.config.config.get("apikey")
-            self._EMBY_HOST = emby_server.config.config.get("host")
-
-            logger.info(f"开始通知媒体服务器 {emby_name} 刷新增量文件 {strm_file}")
-            try:
-                res = emby.post_data(
-                    url=f'[HOST]emby/Library/Media/Updated?api_key=[APIKEY]&reqformat=json',
-                    data=json.dumps({
-                        "Updates": [
-                            {
-                                "Path": strm_file,
-                                "UpdateType": "Created",
-                            }
-                        ]
-                    }),
-                    headers={
-                        "Content-Type": "application/json"
-                    }
-                )
-                if res and res.status_code in [200, 204]:
-                    return True
-                else:
-                    logger.error(f"通知媒体服务器 {emby_name} 刷新新增文件 {strm_file} 失败，错误码：{res.status_code}")
-                    return False
-            except Exception as err:
-                logger.error(f"通知媒体服务器刷新新增文件失败：{str(err)}")
-            return False
-
-    def __get_path(self, paths, file_path: str):
-        """
-        路径转换
-        """
-        if paths and paths.keys():
-            for library_path in paths.keys():
-                if str(file_path).startswith(str(library_path)):
-                    # 替换网盘路径
-                    return str(file_path).replace(str(library_path), str(paths.get(str(library_path))))
-        # 未匹配到路径，返回原路径
-        return file_path
 
     def export_dir(self, dir_id, destination_id="0"):
         """
         获取目录导出id
         """
         export_api = "https://webapi.115.com/files/export_dir"
-        response = requests.post(url=export_api,
-                                 headers=self._headers,
-                                 data={"file_ids": dir_id, "target": f"U_1_{destination_id}"})
+        response = requests.post(
+            url=export_api,
+            headers=self._headers,
+            data={"file_ids": dir_id, "target": f"U_1_{destination_id}"},
+        )
         if response.status_code == 200:
             result = response.json()
             if result.get("state"):
@@ -693,76 +578,86 @@ class StrmGenerator(_PluginBase):
                 logger.info(f"等待目录树导出...")
                 retry_cnt = 60
                 while retry_cnt > 0:
-                    response = requests.get(url=export_api,
-                                            headers=self._headers,
-                                            data={"export_id": export_id})
+                    time.sleep(5)
+                    response = requests.get(
+                        url=export_api,
+                        headers=self._headers,
+                        params={"export_id": export_id},
+                    )
                     if response.status_code == 200:
                         result = response.json()
                         if result.get("state"):
-                            if str(export_id) == str(result.get("data", {}).get("export_id")):
-                                return result.get("data", {}).get("pick_code"), result.get("data", {}).get("file_id")
+                            if not isinstance(result.get("data"), list):
+                                return result.get("data", {}).get(
+                                    "pick_code"
+                                ), result.get("data", {}).get("file_id")
                     retry_cnt -= 1
-                    time.sleep(5)
         return None
-    
+
     def fs_dir_getid(self, path):
         """
         115路径转成ID
         """
         export_api = "https://webapi.115.com/files/getid"
-        response = requests.get(url=export_api,
-                                 headers=self._headers,
-                                 params={"path": path})
+        response = requests.get(
+            url=export_api, headers=self._headers, params={"path": path}
+        )
         if response.status_code == 200:
             result = response.json()
             if result.get("state"):
                 return result.get("id")
         return None
-    
+
     def download_url(self, pickcode):
         """
         获取115文件下载地址
         """
         export_api = "https://webapi.115.com/files/download"
-        response = requests.get(url=export_api,
-                                 headers=self._headers,
-                                 params={"pickcode": pickcode,"dl": 1}) 
+        response = requests.get(
+            url=export_api,
+            headers=self._headers,
+            params={"pickcode": pickcode, "dl": 1},
+        )
         download_url = None
         if response.status_code == 200:
             result = response.json()
             if result.get("state"):
-                response = requests.get(result.get("file_url_302"), headers=self._headers)
+                response = requests.get(
+                    result.get("file_url_302"), headers=self._headers
+                )
                 if response.status_code == 200:
                     result = response.json()
                     if result.get("state"):
                         download_url = result.get("file_url")
                         # 处理Set-Cookie
                         if isinstance(response.headers, Mapping):
-                            match = CRE_SET_COOKIE.search(response.headers["Set-Cookie"])
+                            match = CRE_SET_COOKIE.search(
+                                response.headers["Set-Cookie"]
+                            )
                             if match is not None:
                                 self._headers["Cookie"] += f";{match[0]}"
                         else:
                             for k, v in reversed(response.headers.items()):
-                                if k == "Set-Cookie" and CRE_SET_COOKIE.match(v) is not None:
+                                if (
+                                    k == "Set-Cookie"
+                                    and CRE_SET_COOKIE.match(v) is not None
+                                ):
                                     self._headers["Cookie"] += f";{v}"
                                     break
         return download_url
-    
 
-
-    
-    def fs_delete(self,fid,pid):
+    def fs_delete(self, fid, pid):
         """
         删除115文件
         """
         export_api = "https://webapi.115.com/rb/delete"
-        response = requests.post(url=export_api,
-                                 headers=self._headers,
-                                 data={"fid[0]": fid, "pid": pid})
+        response = requests.post(
+            url=export_api, headers=self._headers, data={"fid[0]": fid, "pid": pid}
+        )
         if response.status_code == 200:
             result = response.json()
             if not result.get("state"):
-                    logger.info(f"目录树删除失败,{result.get('error')}")
+                logger.info(f"目录树删除失败,{result.get('error')}")
 
     def retrieve_directory_structure(self, directory_path):
         """
@@ -785,11 +680,12 @@ class StrmGenerator(_PluginBase):
             logger.info(f"{directory_path} 目录树下载成功")
             return directory_content
         except Exception as e:
-            logger.error(f"{directory_path} 目录树生成失败: {str(e)}")
+            logger.exception("发生错误")
+            # logger.error(f"{directory_path} 目录树生成失败: {str(e)}")
         finally:
             if file_id:
                 try:
-                    self.fs_delete(file_id,"U_1_0")
+                    self.fs_delete(file_id, "U_1_0")
                 except:
                     pass
 
@@ -798,7 +694,9 @@ class StrmGenerator(_PluginBase):
         下载目录树文件内容
         """
         try:
-            with requests.get(url, headers=self._headers, stream=True, timeout=60) as response:
+            with requests.get(
+                url, headers=self._headers, stream=True, timeout=60
+            ) as response:
                 response.raise_for_status()
                 content = BytesIO()
                 for chunk in response.iter_content(chunk_size=8192):
@@ -815,8 +713,15 @@ class StrmGenerator(_PluginBase):
         """
         tree_pattern = re_compile(r"^(?:\| )+\|-")
         dir_path = Path(dir_path)
-        current_path = [str(dir_path.parent)] if dir_path.parent != Path("/") or (dir_path.parent == dir_path and (
-                dir_path.is_absolute() or ':' in dir_path.name)) else ["/"]  # 初始化当前路径为根目录
+        current_path = (
+            [str(dir_path.parent)]
+            if dir_path.parent != Path("/")
+            or (
+                dir_path.parent == dir_path
+                and (dir_path.is_absolute() or ":" in dir_path.name)
+            )
+            else ["/"]
+        )  # 初始化当前路径为根目录
 
         for line in content.splitlines():
             # 匹配目录树的每一行
@@ -828,10 +733,9 @@ class StrmGenerator(_PluginBase):
             level_indicator = match.group(0)
             depth = (len(level_indicator) // 2) - 1
             # 获取当前行的目录名称，去掉前面的 '| ' 或 '- '
-            item_name = line.strip()[len(level_indicator):].strip()
-            #item_name = escape(line.strip()[len(level_indicator):].strip())
-            #item_name = quote(line.strip()[len(level_indicator):].strip(), safe='')
-
+            item_name = line.strip()[len(level_indicator) :].strip()
+            # item_name = escape(line.strip()[len(level_indicator):].strip())
+            # item_name = quote(line.strip()[len(level_indicator):].strip(), safe='')
 
             # 根据深度更新当前路径
             if depth < len(current_path):
@@ -840,183 +744,7 @@ class StrmGenerator(_PluginBase):
                 current_path.append(item_name)  # 添加新的深度名称
 
             # 生成并返回当前深度的完整路径
-            yield join_path(*current_path[:depth + 1]).replace('\\', '/')
-
-    @eventmanager.register(EventType.PluginAction)
-    def remote_sync_one(self, event: Event = None):
-        if event:
-            event_data = event.event_data
-            if not event_data or event_data.get("action") != "strm_one":
-                return
-            args = event_data.get("arg_str")
-            if not args:
-                logger.error(f"缺少参数：{event_data}")
-                return
-            all_args = args
-
-            # 使用正则表达式匹配
-            category = None
-            args_arr = args.split(maxsplit=1)
-            limit = None
-            if len(args_arr) == 2:
-                category = args_arr[0]
-                args = args_arr[1]
-                if str(args).isdigit():
-                    limit = int(args)
-
-            if category:
-                # 判断是不是目录
-                if Path(category).is_dir() and Path(category).exists() and limit is not None:
-                    # 遍历所有监控目录
-                    mon_path = None
-                    for mon in self._category_conf.keys():
-                        if str(category).startswith(mon):
-                            mon_path = mon
-                            break
-
-                    # 指定路径
-                    if not mon_path:
-                        logger.error(f"未找到 {category} 对应的监控目录")
-                        self.post_message(channel=event.event_data.get("channel"),
-                                          title=f"未找到 {category} 对应的监控目录",
-                                          userid=event.event_data.get("user"))
-                        return
-
-                    self.__handle_limit(path=category, mon_path=mon_path, limit=limit, event=event)
-                    return
-                else:
-                    for mon_path in self._category_conf.keys():
-                        mon_category = self._category_conf.get(mon_path)
-                        logger.info(f"开始检查 {mon_path} {mon_category}")
-                        if mon_category and str(category) in mon_category:
-                            parent_path = os.path.join(mon_path, category)
-                            if limit:
-                                logger.info(f"获取到 {category} 对应的监控目录 {parent_path}")
-                                self.__handle_limit(path=parent_path, mon_path=mon_path, limit=limit, event=event)
-                            else:
-                                logger.info(f"获取到 {category} {args} 对应的监控目录 {parent_path}")
-                                target_path = os.path.join(str(parent_path), args)
-                                logger.info(f"开始处理 {target_path}")
-                                target_paths = self.__find_related_paths(os.path.join(str(parent_path), args))
-                                if not target_paths:
-                                    logger.error(f"未查找到 {category} {args} 对应的具体目录")
-                                    self.post_message(channel=event.event_data.get("channel"),
-                                                      title=f"未查找到 {category} {args} 对应的具体目录",
-                                                      userid=event.event_data.get("user"))
-                                    return
-                                for target_path in target_paths:
-                                    logger.info(f"开始定向处理文件夹 ...{target_path}")
-                                    for sroot, sdirs, sfiles in os.walk(target_path):
-                                        for file_name in sdirs + sfiles:
-                                            src_file = os.path.join(sroot, file_name)
-                                            if Path(src_file).is_file():
-                                                self.__handle_file(event_path=str(src_file), mon_path=mon_path)
-
-                                    if event.event_data.get("user"):
-                                        self.post_message(channel=event.event_data.get("channel"),
-                                                          title=f"{target_path} Strm生成完成！",
-                                                          userid=event.event_data.get("user"))
-
-                                    if limit is None and event_data and event_data.get("action") == "strm_one":
-                                        return
-                            return
-            else:
-                # 遍历所有监控目录
-                mon_path = None
-                for mon in self._category_conf.keys():
-                    if str(args).startswith(mon):
-                        mon_path = mon
-                        break
-
-                # 指定路径
-                if mon_path:
-                    if not Path(args).exists():
-                        logger.info(f"同步路径 {args} 不存在")
-                        return
-                    # 处理单文件
-                    if Path(args).is_file():
-                        self.__handle_file(event_path=str(args), mon_path=mon_path)
-                        return
-                    else:
-                        # 处理指定目录
-                        logger.info(f"获取到 {args} 对应的监控目录 {mon_path}")
-
-                        logger.info(f"开始定向处理文件夹 ...{args}")
-                        for sroot, sdirs, sfiles in os.walk(args):
-                            for file_name in sdirs + sfiles:
-                                src_file = os.path.join(sroot, file_name)
-                                if Path(str(src_file)).is_file():
-                                    self.__handle_file(event_path=str(src_file), mon_path=mon_path)
-                        if event.event_data.get("user"):
-                            self.post_message(channel=event.event_data.get("channel"),
-                                              title=f"{all_args} Strm生成完成！", userid=event.event_data.get("user"))
-                        return
-                else:
-                    for mon_path in self._category_conf.keys():
-                        mon_category = self._category_conf.get(mon_path)
-                        logger.info(f"开始检查 {mon_path} {mon_category}")
-                        if mon_category and str(args) in mon_category:
-                            parent_path = os.path.join(mon_path, args)
-                            logger.info(f"获取到 {args} 对应的监控目录 {parent_path}")
-                            for sroot, sdirs, sfiles in os.walk(parent_path):
-                                for file_name in sdirs + sfiles:
-                                    src_file = os.path.join(sroot, file_name)
-                                    if Path(str(src_file)).is_file():
-                                        self.__handle_file(event_path=str(src_file), mon_path=mon_path)
-                            if event.event_data.get("user"):
-                                self.post_message(channel=event.event_data.get("channel"),
-                                                  title=f"{all_args} Strm生成完成！",
-                                                  userid=event.event_data.get("user"))
-                            return
-            if event.event_data.get("user"):
-                self.post_message(channel=event.event_data.get("channel"),
-                                  title=f"{all_args} 未检索到，请检查输入是否正确！",
-                                  userid=event.event_data.get("user"))
-
-    @staticmethod
-    def __find_related_paths(base_path):
-        related_paths = []
-        base_dir = os.path.dirname(base_path)
-        base_name = os.path.basename(base_path)
-
-        for entry in os.listdir(base_dir):
-            if entry.startswith(base_name):
-                full_path = os.path.join(base_dir, entry)
-                if os.path.isdir(full_path):
-                    related_paths.append(full_path)
-
-        # 按照修改时间倒序排列
-        related_paths.sort(key=lambda path: os.path.getmtime(path), reverse=True)
-
-        return related_paths
-
-    def __handle_limit(self, path, limit, mon_path, event):
-        """
-        处理文件数量限制
-        """
-        sub_paths = []
-        for entry in os.listdir(path):
-            full_path = os.path.join(path, entry)
-            if os.path.isdir(full_path):
-                sub_paths.append(full_path)
-
-        if not sub_paths:
-            logger.error(f"未找到 {path} 目录下的文件夹")
-            return
-
-        # 按照修改时间倒序排列
-        sub_paths.sort(key=lambda path: os.path.getmtime(path), reverse=True)
-        logger.info(f"开始定向处理文件夹 ...{path}, 最新 {limit} 个文件夹")
-        for sub_path in sub_paths[:limit]:
-            logger.info(f"开始定向处理文件夹 ...{sub_path}")
-            for sroot, sdirs, sfiles in os.walk(sub_path):
-                for file_name in sdirs + sfiles:
-                    src_file = os.path.join(sroot, file_name)
-                    if Path(src_file).is_file():
-                        self.__handle_file(event_path=str(src_file), mon_path=mon_path)
-            if event.event_data.get("user"):
-                self.post_message(channel=event.event_data.get("channel"),
-                                  title=f"{sub_path} Strm生成完成！", userid=event.event_data.get("user"))
+            yield join_path(*current_path[: depth + 1]).replace("\\", "/")
 
     def send_msg(self):
         """
@@ -1042,8 +770,9 @@ class StrmGenerator(_PluginBase):
                 continue
 
             # 判断剧集最后更新时间距现在是已超过10秒或者电影，发送消息
-            if (datetime.now() - last_update_time).total_seconds() > int(self._interval) \
-                    or str(mtype) == "movie":
+            if (datetime.now() - last_update_time).total_seconds() > int(10) or str(
+                mtype
+            ) == "movie":
                 # 发送通知
                 if self._notify:
                     file_count = len(episodes) if episodes else 1
@@ -1061,15 +790,24 @@ class StrmGenerator(_PluginBase):
                         media_type = MediaType.MOVIE
 
                     # 获取封面图片
-                    mediainfo: MediaInfo = self.chain.recognize_media(meta=file_meta,
-                                                                      mtype=media_type,
-                                                                      tmdbid=file_meta.tmdbid)
+                    mediainfo: MediaInfo = self.chain.recognize_media(
+                        meta=file_meta, mtype=media_type, tmdbid=file_meta.tmdbid
+                    )
 
                     # 发送消息
-                    self.send_transfer_message(msg_title=season_episode,
-                                               file_count=file_count,
-                                               image=(
-                                                   mediainfo.backdrop_path if mediainfo.backdrop_path else mediainfo.poster_path) if mediainfo else None)
+                    self.send_transfer_message(
+                        msg_title=season_episode,
+                        file_count=file_count,
+                        image=(
+                            (
+                                mediainfo.backdrop_path
+                                if mediainfo.backdrop_path
+                                else mediainfo.poster_path
+                            )
+                            if mediainfo
+                            else None
+                        ),
+                    )
                 # 发送完消息，移出key
                 del self._medias[medis_title_year_season]
                 continue
@@ -1081,35 +819,45 @@ class StrmGenerator(_PluginBase):
         # 发送
         self.post_message(
             mtype=NotificationType.Plugin,
-            title=f"{msg_title} Strm已生成", text=f"共{file_count}个文件",
+            title=f"{msg_title} Strm已生成",
+            text=f"共{file_count}个文件",
             image=image,
-            link=settings.MP_DOMAIN('#/history'))
+            link=settings.MP_DOMAIN("#/history"),
+        )
 
     def __update_config(self):
         """
         更新配置
         """
-        self.update_config({
-            "enabled": self._enabled,
-            "onlyonce": self._onlyonce,
-            "cover": self._cover,
-            "notify": self._notify,
-            "rebuild": self._rebuild,
-            "monitor": self._monitor,
-            "interval": self._interval,
-            "copy_files": self._copy_files,
-            "copy_subtitles": self._copy_subtitles,
-            "refresh_emby": self._refresh_emby,
-            "cron": self._cron,
-            "url": self._url,
-            "monitor_confs": self._monitor_confs,
-            "115_cookie": self._115_cookie,
-            "rmt_mediaext": self._rmt_mediaext,
-            "other_mediaext": self._other_mediaext,
-            "mediaservers": self._mediaservers,
-            # 新增：路径替换规则
-            "path_replacements": "\n".join([f"{source}:{target}" for source, target in self._path_replacements.items()]) if self._path_replacements else "",
-        })
+        self.update_config(
+            {
+                "enabled": self._enabled,
+                "onlyonce": self._onlyonce,
+                "cover": self._cover,
+                "notify": self._notify,
+                "rebuild": self._rebuild,
+                "monitor": self._monitor,
+                "copy_files": self._copy_files,
+                "copy_subtitles": self._copy_subtitles,
+                "cron": self._cron,
+                "monitor_confs": self._monitor_confs,
+                "115_cookie": self._115_cookie,
+                "rmt_mediaext": self._rmt_mediaext,
+                "other_mediaext": self._other_mediaext,
+                "mediaservers": self._mediaservers,
+                # 新增：路径替换规则
+                "path_replacements": (
+                    "\n".join(
+                        [
+                            f"{source}:{target}"
+                            for source, target in self._path_replacements.items()
+                        ]
+                    )
+                    if self._path_replacements
+                    else ""
+                ),
+            }
+        )
 
     def get_state(self) -> bool:
         return self._enabled
@@ -1122,23 +870,12 @@ class StrmGenerator(_PluginBase):
         """
         return [
             {
-                "cmd": "/strm_generator",
+                "cmd": "/115_full_scan",
                 "event": EventType.PluginAction,
-                "desc": "云盘Strm生成器",
+                "desc": "115云盘全量扫描",
                 "category": "",
-                "data": {
-                    "action": "StrmGenerator"
-                }
-            },
-            {
-                "cmd": "/strm",
-                "event": EventType.PluginAction,
-                "desc": "定向云盘Strm同步",
-                "category": "",
-                "data": {
-                    "action": "strm_one"
-                }
-            },
+                "data": {"action": "115_full_scan"},
+            }
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -1152,465 +889,276 @@ class StrmGenerator(_PluginBase):
             "kwargs": {} # 定时器参数
         }]
         """
+        logger.debug("调用get_service方法33")
         if self._enabled and self._cron:
-            return [{
-                "id": "StrmGenerator",
-                "name": "云盘Strm生成器",
-                "trigger": CronTrigger.from_crontab(self._cron),
-                "func": self.scan,
-                "kwargs": {}
-            }]
+            logger.info("返回MP服务配置")
+            return [
+                {
+                    "id": "115_full_scan",
+                    "name": "115云盘全量同步",
+                    "trigger": CronTrigger.from_crontab(self._cron),
+                    "func": self.full_scan,
+                    "kwargs": {},
+                }
+            ]
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
         pass
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+
+        logger.debug("调用get_form方法")
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
         return [
             {
-                'component': 'VForm',
-                'content': [
+                "component": "VForm",
+                "content": [
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'warning',
-                                            'variant': 'tonal',
-                                            'text': '云盘实时监控任何问题不予处理，请自行消化。'
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "enabled",
+                                            "label": "启用插件",
+                                        },
                                     }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'enabled',
-                                            'label': '启用插件',
-                                        }
-                                    }
-                                ]
+                                ],
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'monitor',
-                                            'label': '实时监控',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "monitor",
+                                            "label": "文件整理实时监控",
+                                        },
                                     }
-                                ]
+                                ],
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'copy_files',
-                                            'label': '复制非媒体文件',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "copy_files",
+                                            "label": "复制非媒体文件",
+                                        },
                                     }
-                                ]
-                            }
-                        ]
+                                ],
+                            },
+                        ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'onlyonce',
-                                            'label': '全量同步一次',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "onlyonce",
+                                            "label": "全量生成一次",
+                                        },
                                     }
-                                ]
+                                ],
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'rebuild',
-                                            'label': '重建缓存',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "rebuild",
+                                            "label": "重建云盘文件索引",
+                                        },
                                     }
-                                ]
+                                ],
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'cover',
-                                            'label': '覆盖已存在文件',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "cover",
+                                            "label": "覆盖已存在文件",
+                                        },
                                     }
-                                ]
-                            }
-                        ]
+                                ],
+                            },
+                        ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'notify',
-                                            'label': '发送通知',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "notify",
+                                            "label": "发送消息通知",
+                                        },
                                     }
-                                ]
+                                ],
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'refresh_emby',
-                                            'label': '刷新媒体库（Emby）',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "copy_subtitles",
+                                            "label": "复制字幕文件",
+                                        },
                                     }
-                                ]
+                                ],
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'copy_subtitles',
-                                            'label': '复制字幕文件',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "uriencode",
+                                            "label": "Strm内容URL编码",
+                                        },
                                     }
-                                ]
+                                ],
                             },
-                        ]
+                        ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'uriencode',
-                                            'label': 'url编码',
-                                        }
+                                        "component": "VCronField",
+                                        "props": {
+                                            "model": "cron",
+                                            "label": "同步周期",
+                                            "placeholder": "0 0 * * *",
+                                        },
                                     }
-                                ]
-                            },
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VCronField',
-                                        'props': {
-                                            'model': 'cron',
-                                            'label': '同步周期',
-                                            'placeholder': '0 0 * * *'
-                                        }
-                                    }
-                                ]
+                                ],
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
                                     {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': '115_cookie',
-                                            'label': '115Cookie',
-                                        }
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "115_cookie",
+                                            "label": "115Cookie",
+                                        },
                                     }
-                                ]
+                                ],
                             },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'interval',
-                                            'label': '消息延迟',
-                                            'placeholder': '10'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
+                        ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
                                     {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'monitor_confs',
-                                            'label': '目录配置',
-                                            'rows': 5,
-                                            'placeholder': 'MoviePilot中云盘挂载本地的路径#MoviePilot中strm生成路径#alist/cd2上115路径#strm格式化'
-                                        }
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "monitor_confs",
+                                            "label": "目录配置",
+                                            "rows": 5,
+                                            "placeholder": "MoviePilot中云盘挂载本地的路径#MoviePilot中strm生成路径#alist/cd2上115路径#strm格式化",
+                                        },
                                     }
-                                ]
+                                ],
                             }
-                        ]
+                        ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
                                     {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'rmt_mediaext',
-                                            'label': '视频格式',
-                                            'rows': 2,
-                                            'placeholder': ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v"
-                                        }
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "rmt_mediaext",
+                                            "label": "视频格式",
+                                            "rows": 2,
+                                            "placeholder": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",
+                                        },
                                     }
-                                ]
+                                ],
                             }
-                        ]
+                        ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
                                     {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'other_mediaext',
-                                            'label': '非媒体文件格式',
-                                            'rows': 2,
-                                            'placeholder': ".nfo, .jpg"
-                                        }
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "other_mediaext",
+                                            "label": "非媒体文件格式",
+                                            "rows": 2,
+                                            "placeholder": ".nfo, .jpg",
+                                        },
                                     }
-                                ]
+                                ],
                             }
-                        ]
+                        ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
                                     {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'multiple': True,
-                                            'chips': True,
-                                            'clearable': True,
-                                            'model': 'mediaservers',
-                                            'label': '媒体服务器',
-                                            'items': [{"title": config.name, "value": config.name}
-                                                      for config in self.mediaserver_helper.get_configs().values() if
-                                                      config.type == "emby"]
-                                        }
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "path_replacements",
+                                            "label": "Strm内容路径替换规则",
+                                            "rows": 3,
+                                            "placeholder": "源路径:目标路径（每行一条规则）",
+                                        },
                                     }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 8
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'emby_path',
-                                            'rows': '1',
-                                            'label': '媒体库路径映射',
-                                            'placeholder': 'MoviePilot本地文件路径:Emby文件路径（多组路径英文逗号拼接）'
-                                        }
-                                    }
-                                ]
+                                ],
                             }
-                        ]
-                    },
-                    # 新增：路径替换规则文本框
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'path_replacements',
-                                            'label': '路径替换规则',
-                                            'rows': 3,
-                                            'placeholder': '源路径:目标路径（每行一条规则）'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': 'MoviePilot中云盘挂载本地的路径：/mnt/media/series/国产剧/雪迷宫 (2024)；'
-                                                    'MoviePilot中strm生成路径：/mnt/library/series/国产剧/雪迷宫 (2024)；'
-                                                    '云盘路径：/cloud/media/series/国产剧/雪迷宫 (2024)；'
-                                                    '则目录配置为：/mnt/media#/mnt/library#/cloud/media#{local_file}'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': 'strm格式化方式，自行把()替换为alist/cd2上路径：'
-                                                    '1.本地源文件路径：{local_file}。'
-                                                    '2.alist路径：http://192.168.31.103:5244/d/115{cloud_file}。'
-                                                    '3.cd2路径：http://192.168.31.103:19798/static/http/192.168.31.103:19798/False/115{cloud_file}。'
-                                                    '4.其他api路径：http://192.168.31.103:2001/{cloud_file}'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
+                        ],
                     },
                     {
                         "component": "VRow",
@@ -1622,18 +1170,46 @@ class StrmGenerator(_PluginBase):
                                 },
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VAlert",
                                         "props": {
-                                            "model": "url",
-                                            "label": "任务推送url",
-                                            "placeholder": "post请求json方式推送path和type(add)字段",
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "MoviePilot中云盘挂载本地的路径：/mnt/media/series/国产剧/雪迷宫 (2024)；"
+                                            "MoviePilot中strm生成路径：/mnt/library/series/国产剧/雪迷宫 (2024)；"
+                                            "云盘路径：/cloud/media/series/国产剧/雪迷宫 (2024)；"
+                                            "则目录配置为：/mnt/media#/mnt/library#/cloud/media#{local_file}",
                                         },
                                     }
                                 ],
-                            },
+                            }
                         ],
                     },
-                ]
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {
+                                    "cols": 12,
+                                },
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "strm格式化方式，自行把()替换为alist/cd2上路径："
+                                            "1.本地源文件路径：{local_file}。"
+                                            "2.alist路径：http://192.168.31.103:5244/d/115{cloud_file}。"
+                                            "3.cd2路径：http://192.168.31.103:19798/static/http/192.168.31.103:19798/False/115{cloud_file}。"
+                                            "4.其他api路径：http://192.168.31.103:2001/{cloud_file}",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
             }
         ], {
             "enabled": False,
@@ -1655,22 +1231,13 @@ class StrmGenerator(_PluginBase):
             "url": "",
             "other_mediaext": ".nfo, .jpg, .png, .json",
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",
-            "path_replacements": ""  # 新增：路径替换规则默认值
+            "path_replacements": "",  # 新增：路径替换规则默认值
         }
 
     def get_page(self) -> List[dict]:
         pass
 
     def stop_service(self):
-        if self._observer:
-            for observer in self._observer:
-                try:
-                    observer.stop()
-                    observer.join()
-                except Exception as e:
-                    logger.error(f"停止观察者失败: {str(e)}")
-            self._observer = []
-
         if self._scheduler:
             try:
                 self._scheduler.remove_all_jobs()

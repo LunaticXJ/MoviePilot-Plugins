@@ -1,14 +1,14 @@
 {
   "StrmGenerator": {
-    "name": "Strm生成器",
-    "description": "实时监控、定时全量增量生成strm文件。",
+    "name": "115云盘Strm助手",
+    "description": "115云盘Strm助手，支持全量定时快速生成和基于整理事件增量实时生成。",
     "labels": "云盘",
-    "version": "3.0.0",
-    "icon": "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/cloudcompanion.png",
+    "version": "3.0.1",
+    "icon": "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
-      "v1.0": "实时监控、定时全量增量生成strm文件"
+      "v3.0.1": "支持全量定时快速生成和基于整理事件增量实时生成"
     }
   }
 }
