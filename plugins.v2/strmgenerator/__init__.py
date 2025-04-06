@@ -35,11 +35,11 @@ class StrmGenerator(_PluginBase):
     # 插件名称
     plugin_name = "115云盘Strm助手"
     # 插件描述
-    plugin_desc = "115云盘全量快速生成工具，并可实时MP新整理入库的文件。"
+    plugin_desc = "115云盘全量快速生成工具，并可实时处理MP新整理入库的文件。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png"
     # 插件版本
-    plugin_version = "3.0.1"
+    plugin_version = "3.0.2"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -317,7 +317,7 @@ class StrmGenerator(_PluginBase):
                 )
             return
 
-        logger.info(f"发现 {len(new_files)} 个新文件需要处理")
+        logger.info(f"发现 {len(new_files)} 个新文件")
 
         # 记录成功处理的文件
         processed_files = set()
@@ -396,7 +396,7 @@ class StrmGenerator(_PluginBase):
             seconds = elapsed_time % 60
             elapsed_time_str = f"{int(minutes)} 分 {seconds:.2f} 秒"
         logger.info(
-            f"云盘Strm同步生成任务完成，共处理 {len(processed_files)} 个文件，耗时 {elapsed_time_str}"
+            f"云盘Strm同步生成任务完成，共处理 {len(processed_files)} 个媒体文件，耗时 {elapsed_time_str}"
         )
 
         if event:
@@ -427,8 +427,8 @@ class StrmGenerator(_PluginBase):
                     strm_file=target_file, strm_content=strm_content
                 ):
                     with lock:
-                        self._cloud_files.add(cloud_file)  # 更新缓存
-                        self._dirty = True  # 标记为脏数据
+                        self._cloud_files.add(cloud_file)
+                        self._dirty = True
             elif self._copy_files and file_suffix in self._other_mediaext_set:
                 os.makedirs(os.path.dirname(target_file), exist_ok=True)
                 shutil.copy2(event_path, target_file)
@@ -460,9 +460,6 @@ class StrmGenerator(_PluginBase):
     def __format_content(
         format_str: str, local_file: str, cloud_file: str, uriencode: bool
     ):
-        """
-        格式化strm内容
-        """
         if "{local_file}" in format_str:
             return format_str.replace("{local_file}", local_file)
         elif "{cloud_file}" in format_str:
@@ -478,27 +475,27 @@ class StrmGenerator(_PluginBase):
 
     def __create_strm_file(self, strm_file: str, strm_content: str):
         try:
-            # 创建目标文件夹
+            # 创建Strm文件存储文件夹
             if not Path(strm_file).parent.exists():
                 os.makedirs(Path(strm_file).parent)
 
-            # 构造.strm文件路径
+            # 构造Strm文件路径
             strm_file = os.path.join(
                 Path(strm_file).parent,
                 f"{os.path.splitext(Path(strm_file).name)[0]}.strm",
             )
 
-            # 目标文件若存在且不覆盖，则跳过
+            # 目标Strm文件若存在且不覆盖，则跳过
             if Path(strm_file).exists() and not self._cover:
                 logger.info(f"目标strm文件已存在，跳过: {strm_file} ")
                 return True
-            # 新增：应用自定义路径替换规则
+            # 应用Strm内容路径替换规则
             for source, target in self._path_replacements.items():
                 if source in strm_content:
                     strm_content = strm_content.replace(source, target)
                     logger.debug(f"应用路径替换规则: {source} -> {target}")
 
-            # 写入.strm文件
+            # 创建strm文件
             with open(strm_file, "w", encoding="utf-8") as f:
                 f.write(strm_content)
             logger.info(f"创建strm文件成功: {strm_file}")
@@ -508,7 +505,7 @@ class StrmGenerator(_PluginBase):
                 file_meta = MetaInfoPath(Path(strm_file))
 
                 pattern = r"tmdbid=(\d+)"
-                # 提取 tmdbid
+                # 提取tmdbid
                 match = re.search(pattern, strm_file)
                 if match:
                     tmdbid = match.group(1)
@@ -575,6 +572,7 @@ class StrmGenerator(_PluginBase):
                     if response.status_code == 200:
                         result = response.json()
                         if result.get("state"):
+                            # 当文件未生成时，返回data为空列表：[]，否则返回对象格式
                             if not isinstance(result.get("data"), list):
                                 return result.get("data", {}).get(
                                     "pick_code"
@@ -668,14 +666,13 @@ class StrmGenerator(_PluginBase):
             logger.info(f"{directory_path} 目录树下载成功")
             return directory_content
         except Exception as e:
-            logger.exception("发生错误")
-            # logger.error(f"{directory_path} 目录树生成失败: {str(e)}")
+            logger.error(f"{directory_path} 目录树生成失败: {str(e)}")
         finally:
             if file_id:
                 try:
                     self.fs_delete(file_id, "U_1_0")
                 except:
-                    pass
+                    logger.error(f"目录树删除失败: {str(e)}")
 
     def fetch_content(self, url):
         """
@@ -909,13 +906,44 @@ class StrmGenerator(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VSubheader",
+                                        "text": "基础设置",
+                                        "props": {
+                                            "class": "font-weight-bold",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "enabled",
-                                            "label": "启用插件",
+                                            "label": "全量周期同步",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "onlyonce",
+                                            "label": "全量同步一次",
                                         },
                                     }
                                 ],
@@ -933,19 +961,76 @@ class StrmGenerator(_PluginBase):
                                     }
                                 ],
                             },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
-                                        "component": "VSwitch",
+                                        "component": "VCronField",
                                         "props": {
-                                            "model": "copy_files",
-                                            "label": "复制非媒体文件",
+                                            "model": "cron",
+                                            "label": "同步周期",
+                                            "placeholder": "0 0 * * *",
                                         },
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 9},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "115_cookie",
+                                            "label": "115Cookie",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "monitor_confs",
+                                            "label": "目录配置",
+                                            "rows": 2,
+                                            "placeholder": "MoviePilot中云盘挂载本地的路径#MoviePilot中strm生成路径#alist/cd2上115路径#strm格式化",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VSubheader",
+                                        "text": "额外设置",
+                                        "props": {
+                                            "class": "font-weight-bold",
+                                        },
+                                    }
+                                ],
+                            }
                         ],
                     },
                     {
@@ -958,8 +1043,8 @@ class StrmGenerator(_PluginBase):
                                     {
                                         "component": "VSwitch",
                                         "props": {
-                                            "model": "onlyonce",
-                                            "label": "全量生成一次",
+                                            "model": "cover",
+                                            "label": "覆盖已存在文件",
                                         },
                                     }
                                 ],
@@ -984,8 +1069,8 @@ class StrmGenerator(_PluginBase):
                                     {
                                         "component": "VSwitch",
                                         "props": {
-                                            "model": "cover",
-                                            "label": "覆盖已存在文件",
+                                            "model": "notify",
+                                            "label": "发送消息通知",
                                         },
                                     }
                                 ],
@@ -1002,8 +1087,8 @@ class StrmGenerator(_PluginBase):
                                     {
                                         "component": "VSwitch",
                                         "props": {
-                                            "model": "notify",
-                                            "label": "发送消息通知",
+                                            "model": "copy_files",
+                                            "label": "复制非媒体文件",
                                         },
                                     }
                                 ],
@@ -1041,59 +1126,7 @@ class StrmGenerator(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VCronField",
-                                        "props": {
-                                            "model": "cron",
-                                            "label": "同步周期",
-                                            "placeholder": "0 0 * * *",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "115_cookie",
-                                            "label": "115Cookie",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "monitor_confs",
-                                            "label": "目录配置",
-                                            "rows": 5,
-                                            "placeholder": "MoviePilot中云盘挂载本地的路径#MoviePilot中strm生成路径#alist/cd2上115路径#strm格式化",
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 9},
                                 "content": [
                                     {
                                         "component": "VTextarea",
@@ -1105,15 +1138,10 @@ class StrmGenerator(_PluginBase):
                                         },
                                     }
                                 ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
+                            },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VTextarea",
@@ -1125,7 +1153,7 @@ class StrmGenerator(_PluginBase):
                                         },
                                     }
                                 ],
-                            }
+                            },
                         ],
                     },
                     {
@@ -1140,7 +1168,7 @@ class StrmGenerator(_PluginBase):
                                         "props": {
                                             "model": "path_replacements",
                                             "label": "Strm内容路径替换规则",
-                                            "rows": 3,
+                                            "rows": 2,
                                             "placeholder": "源路径:目标路径（每行一条规则）",
                                         },
                                     }
