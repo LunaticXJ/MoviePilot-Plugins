@@ -39,7 +39,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png"
     # 插件版本
-    plugin_version = "3.0.2"
+    plugin_version = "3.0.3"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -608,12 +608,18 @@ class StrmGenerator(_PluginBase):
         if response.status_code == 200:
             result = response.json()
             if result.get("state"):
+                if not result.get("file_url_302"):
+                    logger.error(f"获取115文件302下载地址失败: {str(result)}")
+                    return None
                 response = requests.get(
                     result.get("file_url_302"), headers=self._headers
                 )
                 if response.status_code == 200:
                     result = response.json()
                     if result.get("state"):
+                        if not result.get("file_url"):
+                            logger.error(f"获取115文件直链下载地址失败: {str(result)}")
+                            return None
                         download_url = result.get("file_url")
                         # 处理Set-Cookie
                         if isinstance(response.headers, Mapping):
@@ -658,11 +664,17 @@ class StrmGenerator(_PluginBase):
                 return
             pick_code, file_id = self.export_dir(dir_id)
             if not pick_code:
-                logger.error(f"{directory_path} 生成目录树失败")
+                logger.error(f"{directory_path} 请求生成目录树失败")
                 return
             # 获取目录树下载链接
             download_url = self.download_url(pick_code)
+            if not download_url:
+                logger.error(f"{directory_path} 目录树下载链接获取失败")
+                return
             directory_content = self.fetch_content(download_url)
+            if not directory_content:
+                logger.error(f"{directory_path} 目录树下载失败")
+                return
             logger.info(f"{directory_path} 目录树下载成功")
             return directory_content
         except Exception as e:
