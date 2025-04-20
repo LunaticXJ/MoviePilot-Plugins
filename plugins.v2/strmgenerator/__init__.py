@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import shutil
 import threading
 import time
@@ -34,7 +33,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png"
     # 插件版本
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -66,7 +65,7 @@ class StrmGenerator(_PluginBase):
     _cloud_files_json = "cloud_files.json"
     _cloud_115_helper = None
     _rmt_mediaext_set = set()
-    
+
     _sync_type: str = ""
     _sync_del = False
     _cloud_del_paths = {}
@@ -75,7 +74,7 @@ class StrmGenerator(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
     # 退出事件
     _event = threading.Event()
-        
+
     def init_plugin(self, config: dict = None):
         logger.debug(f"初始化插件 {self.plugin_name}")
         self._strm_dir_conf = {}
@@ -106,7 +105,7 @@ class StrmGenerator(_PluginBase):
                         self._path_replacements[source.strip()] = target.strip()
             self._115_cookie = config.get("115_cookie")
             self._cloud_115_helper = Cloud115Helper(cookie=self._115_cookie)
-            
+
             self._sync_type = config.get("sync_type")
             self._sync_del = config.get("sync_del")
             if config.get("del_paths"):
@@ -351,7 +350,9 @@ class StrmGenerator(_PluginBase):
                         json.dump(list(self._cloud_files), file)
                     self._dirty = False
                 except Exception as e:
-                    logger.error(f"写入本地索引文件失败：{str(e)} - {traceback.format_exc()}")
+                    logger.error(
+                        f"写入本地索引文件失败：{str(e)} - {traceback.format_exc()}"
+                    )
 
     def __format_content(
         self, format_str: str, local_file: str, cloud_file: str, uriencode: bool
@@ -397,9 +398,11 @@ class StrmGenerator(_PluginBase):
             logger.info(f"创建strm文件成功: {strm_file}")
             return True
         except Exception as e:
-            logger.error(f"创建strm文件{strm_file}失败：{str(e)} - {traceback.format_exc()}")
+            logger.error(
+                f"创建strm文件{strm_file}失败：{str(e)} - {traceback.format_exc()}"
+            )
         return False
-    
+
     @eventmanager.register(EventType.WebhookMessage)
     def sync_del(self, event):
         if not self._sync_del or not self._sync_type:
@@ -407,17 +410,23 @@ class StrmGenerator(_PluginBase):
         event_data = event.event_data
         event_type = event_data.event
         # ScripterX插件 event_type = media_del，Emby Webhook event_type = library.deleted
-        if not event_type or str(event_type) not in ["media_del","library.deleted"]:
+        if not event_type or str(event_type) not in ["media_del", "library.deleted"]:
             return
         logger.info(f"收到媒体删除请求：{event.event_data}")
-        scripterx_matched=str(self._sync_type) == "scripterx" and event_type == "media_del"
-        webhook_matched=str(self._sync_type) == "webhook" and event_type == "library.deleted"
-        
+        scripterx_matched = (
+            str(self._sync_type) == "scripterx" and event_type == "media_del"
+        )
+        webhook_matched = (
+            str(self._sync_type) == "webhook" and event_type == "library.deleted"
+        )
+
         if scripterx_matched or webhook_matched:
             # Scripter X插件方式，item_isvirtual参数未配置，为防止误删除，暂停插件运行
             if scripterx_matched:
                 if not event_data.item_isvirtual:
-                    logger.error("ScripterX插件未配置item_isvirtual参数，为防止误删除不进行处理")
+                    logger.error(
+                        "ScripterX插件未配置item_isvirtual参数，为防止误删除不进行处理"
+                    )
                     return
                 # 如果是虚拟item，则直接return，不进行删除
                 if event_data.item_isvirtual == "True":
@@ -426,7 +435,7 @@ class StrmGenerator(_PluginBase):
             media_path = event_data.item_path
             if not media_path:
                 logger.error("未获取到删除媒体路径，不进行处理")
-            else:    
+            else:
                 self.__clouddisk_del(media_path)
         else:
             logger.error(f"媒体删除请求事件类型与配置不匹配，不做处理")
@@ -436,21 +445,27 @@ class StrmGenerator(_PluginBase):
         cloud_file = self.__get_path(self._cloud_del_paths, str(media_path))
         if not cloud_file:
             return
-        logger.info(f"获取到云盘同步删除映射配置：{self._cloud_del_paths}，替换后云盘文件路径 {cloud_file}")
+        logger.info(
+            f"获取到云盘同步删除映射配置：{self._cloud_del_paths}，替换后云盘文件路径 {cloud_file}"
+        )
 
         if Path(cloud_file).suffix:
             cloud_file_path = Path(cloud_file)
             # 删除文件名开头相同的文件
             pattern = f"{cloud_file_path.stem}*"
             files = list(cloud_file_path.parent.glob(pattern))
-            logger.info(f"筛选到 {cloud_file_path.parent} 下匹配的文件 {pattern} {files}")
+            logger.info(
+                f"筛选到 {cloud_file_path.parent} 下匹配的文件 {pattern} {files}"
+            )
             for file in files:
                 file.unlink()
                 logger.info(f"云盘文件 {file} 已删除")
 
             # 删除空目录
             # 判断当前媒体父路径下是否有媒体文件，如有则无需遍历父级
-            if not SystemUtils.exits_files(cloud_file_path.parent, settings.RMT_MEDIAEXT):
+            if not SystemUtils.exits_files(
+                cloud_file_path.parent, settings.RMT_MEDIAEXT
+            ):
                 # 判断父目录是否为空, 为空则删除
                 i = 0
                 for parent_path in cloud_file_path.parents:
@@ -460,7 +475,9 @@ class StrmGenerator(_PluginBase):
                     logger.debug(f"开始检查父目录 {parent_path} 是否可删除")
                     if str(parent_path.parent) != str(cloud_file_path.root):
                         # 父目录非根目录，才删除父目录
-                        if not SystemUtils.exits_files(parent_path, settings.RMT_MEDIAEXT):
+                        if not SystemUtils.exits_files(
+                            parent_path, settings.RMT_MEDIAEXT
+                        ):
                             # 当前路径下没有媒体文件则删除
                             shutil.rmtree(parent_path)
                             logger.warn(f"云盘目录 {parent_path} 已删除")
@@ -468,7 +485,6 @@ class StrmGenerator(_PluginBase):
             if Path(cloud_file).exists():
                 shutil.rmtree(cloud_file)
                 logger.warn(f"云盘目录 {cloud_file} 已删除")
-
 
     def __get_path(self, paths, file_path: str):
         """
@@ -478,12 +494,11 @@ class StrmGenerator(_PluginBase):
             for library_path in paths.keys():
                 if str(file_path).startswith(str(library_path)):
                     # 替换网盘路径
-                    return str(file_path).replace(str(library_path), str(paths.get(str(library_path))))
+                    return str(file_path).replace(
+                        str(library_path), str(paths.get(str(library_path)))
+                    )
         # 未匹配到路径，返回原路径
-        return file_path        
-        
-        
-        
+        return file_path
 
     def __update_config(self):
         self.update_config(
@@ -511,7 +526,7 @@ class StrmGenerator(_PluginBase):
         )
 
     def get_state(self) -> bool:
-        return self._enabled
+        return self._enabled or self._monitor or self._sync_del
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -800,67 +815,67 @@ class StrmGenerator(_PluginBase):
                         ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
                                     {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'sync_del',
-                                            'label': '云盘同步删除',
-                                        }
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "sync_del",
+                                            "label": "云盘同步删除",
+                                        },
                                     }
-                                ]
+                                ],
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
                                     {
-                                        'component': 'VSelect',
-                                        'props': {
-                                            'model': 'sync_type',
-                                            'label': '媒体库同步方式',
-                                            'items': [
-                                                {'title': 'Webhook', 'value': 'webhook'},
-                                                {'title': 'Scripter X', 'value': 'scripterx'}
-                                            ]
-                                        }
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "sync_type",
+                                            "label": "媒体库同步方式",
+                                            "items": [
+                                                {
+                                                    "title": "Webhook",
+                                                    "value": "webhook",
+                                                },
+                                                {
+                                                    "title": "Scripter X",
+                                                    "value": "scripterx",
+                                                },
+                                            ],
+                                        },
                                     }
-                                ]
+                                ],
                             },
-                        ]
+                        ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
+                                "component": "VCol",
+                                "props": {
+                                    "cols": 12,
                                 },
-                                'content': [
+                                "content": [
                                     {
-                                        'component': 'VTextarea',
-                                        'props': {
-                                            'model': 'del_paths',
-                                            'rows': '2',
-                                            'label': '云盘同步删除路径映射',
-                                            'placeholder': 'Emby服务器strm访问路径:MoviePilot云盘文件挂载路径（一行一个）'
-                                        }
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "del_paths",
+                                            "rows": "2",
+                                            "label": "云盘同步删除路径映射",
+                                            "placeholder": "Emby服务器strm访问路径:MoviePilot云盘文件挂载路径（一行一个）",
+                                        },
                                     }
-                                ]
+                                ],
                             }
-                        ]
+                        ],
                     },
                     {
                         "component": "VRow",
@@ -912,28 +927,28 @@ class StrmGenerator(_PluginBase):
                         ],
                     },
                     {
-                        'component': 'VRow',
-                        'content': [
+                        "component": "VRow",
+                        "content": [
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
+                                "component": "VCol",
+                                "props": {
+                                    "cols": 12,
                                 },
-                                'content': [
+                                "content": [
                                     {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': '云盘同步删除路径映射：'
-                                                    'Emby服务器Strm文件访问路径:/data/series/A.strm,'
-                                                    'MoviePilot云盘文件挂载路径:/mnt/cloud/series/A.mp4。'
-                                                    '路径映射填/data:/mnt/cloud'
-                                        }
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "text": "云盘同步删除路径映射："
+                                            "Emby服务器Strm文件访问路径:/data/series/A.strm,"
+                                            "MoviePilot云盘文件挂载路径:/mnt/cloud/series/A.mp4。"
+                                            "路径映射填/data:/mnt/cloud",
+                                        },
                                     }
-                                ]
+                                ],
                             }
-                        ]
+                        ],
                     },
                 ],
             }
@@ -949,7 +964,11 @@ class StrmGenerator(_PluginBase):
             "monitor_confs": "",
             "115_cookie": "",
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",
-            "path_replacements": ""
+            "path_replacements": "",
+            "sync_del": False,
+            "sync_type": "",
+            "del_paths": "",
+            "_tabs": "generator_tab",
         }
 
     def get_page(self) -> List[dict]:

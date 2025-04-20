@@ -3,12 +3,12 @@
     "name": "115云盘Strm助手",
     "description": "115云盘全量快速生成工具，并可实时处理MP新整理入库的文件。",
     "labels": "云盘",
-    "version": "3.1.0",
+    "version": "3.1.1",
     "icon": "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
-      "v3.1.0": "新增云盘文件同步删除功能",
+      "v3.1.1": "新增云盘文件同步删除功能",
       "v3.0.0": "支持全量定时快速生成和基于整理事件增量实时生成"
     }
   }
