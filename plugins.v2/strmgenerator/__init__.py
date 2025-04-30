@@ -736,7 +736,7 @@ class StrmGenerator(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "rebuild",
-                                            "label": "忽略Strm生成记录缓存",
+                                            "label": "重置Strm生成记录缓存",
                                         },
                                     }
                                 ],
