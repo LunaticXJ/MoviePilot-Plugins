@@ -14,7 +14,7 @@
   },
   "EmbyLatestMediaSort": {
     "name": "Emby最新媒体排序",
-    "description": "将Emby媒体加入时间初始化为发布时间，让首页最新媒体列表按发布日期倒序排列。",
+    "description": "将Emby媒体加入时间设置为发布时间，让首页最新媒体列表按发布日期倒序排列。",
     "labels": "媒体库",
     "version": "1.0.0",
     "icon": "Element_A.png",
