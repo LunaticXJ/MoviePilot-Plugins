@@ -33,7 +33,7 @@ class StrmGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png"
     # 插件版本
-    plugin_version = "3.1.1"
+    plugin_version = "3.1.2"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -111,6 +111,7 @@ class StrmGenerator(_PluginBase):
             if config.get("del_paths"):
                 for path in str(config.get("del_paths")).split("\n"):
                     self._cloud_del_paths[path.split(":")[0]] = path.split(":")[1]
+                
 
         # 停止现有任务
         self.stop_service()
@@ -522,6 +523,18 @@ class StrmGenerator(_PluginBase):
                     if self._path_replacements
                     else ""
                 ),
+                "sync_del": self._sync_del,
+                "sync_type": self._sync_type,
+                "del_paths": (
+                    "\n".join(
+                        [
+                            f"{source}:{target}"
+                            for source, target in self._cloud_del_paths.items()
+                        ]
+                    )
+                    if self._cloud_del_paths
+                    else ""
+                )
             }
         )
 
@@ -967,8 +980,7 @@ class StrmGenerator(_PluginBase):
             "path_replacements": "",
             "sync_del": False,
             "sync_type": "",
-            "del_paths": "",
-            "_tabs": "generator_tab",
+            "del_paths": ""
         }
 
     def get_page(self) -> List[dict]:
