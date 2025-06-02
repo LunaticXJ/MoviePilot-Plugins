@@ -133,7 +133,7 @@ class StrmGenerator(_PluginBase):
                     self._cloud_files = set(json.loads(content))
 
         # 当插件的启用或全量运行一次开关打开时
-        if self._enabled or self._onlyonce:
+        if self._enabled or self._onlyonce or self._monitor:
             # 初始化调度器
             if not self._scheduler:
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
