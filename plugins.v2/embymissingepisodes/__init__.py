@@ -1,7 +1,4 @@
-import csv
 import json
-import io
-import base64
 import urllib.parse
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -9,7 +6,6 @@ from typing import Any, List, Dict, Tuple, Optional
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi.responses import Response
 
 from app.core.config import settings
 from app.helper.mediaserver import MediaServerHelper
@@ -21,7 +17,7 @@ from app.utils.http import RequestUtils
 
 class EmbyMissingEpisodes(_PluginBase):
     """
-    Emby 剧集缺集检查插件：极简版，聚合显示缺失季集，完美解决表格展示与导出认证问题
+    Emby 剧集缺集检查插件：极简版，聚合显示缺失季集，纯本地重新加载刷新与 CSV 免鉴权导出
     """
 
     # 插件名称
@@ -29,9 +25,9 @@ class EmbyMissingEpisodes(_PluginBase):
     # 插件描述
     plugin_desc = "精准查找 Emby 库中剧集的缺失集情况，聚合显示并支持导出 CSV。"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/emby.png"
+    plugin_icon = ""
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.3.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -63,7 +59,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         """
-        初始化插件配置
+        初始化插件配置与历史数据重载
         """
         self.stop_service()
         self.mediaserver_helper = MediaServerHelper()
@@ -77,7 +73,6 @@ class EmbyMissingEpisodes(_PluginBase):
             self._ignore_season_zero = config.get("ignore_season_zero", True)
             self._ignore_future = config.get("ignore_future", True)
 
-            # 只要勾选了“立即运行一次”就启动后台扫描
             if self._onlyonce:
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
 
@@ -89,7 +84,6 @@ class EmbyMissingEpisodes(_PluginBase):
                     name="Emby缺集扫描"
                 )
 
-                # 重置一次性开关并保存
                 self._onlyonce = False
                 self.__update_config()
 
@@ -98,7 +92,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _load_saved_data(self):
         """
-        从存储读取数据
+        仅从本地持久化存储（文件/数据库）重新加载数据到内存
         """
         try:
             saved_data = self.get_data(self._STORAGE_DATA_KEY)
@@ -111,7 +105,6 @@ class EmbyMissingEpisodes(_PluginBase):
             logger.error(f"【EmbyMissingEpisodes】读取持久化数据失败: {e}")
 
     def get_state(self) -> bool:
-        # 始终保持插件启用状态，去除全局 Switch 开关
         return True
 
     def __update_config(self):
@@ -130,20 +123,11 @@ class EmbyMissingEpisodes(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "path": "/export",
-                "endpoint": self.api_export_csv,
-                "auth": "none",  # 👈 核心修复：设置为 none 允许浏览器未携带 Bearer 头时直接下载 CSV
-                "methods": ["GET"],
-                "summary": "导出 CSV",
-                "description": "导出缺失剧集结果为 CSV 文件",
-            },
-        ]
+        return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
-        极简版系统配置页面：去除“启用插件”开关，只保留“立即运行一次”和服务器选择
+        配置页面
         """
         return [
             {
@@ -227,22 +211,41 @@ class EmbyMissingEpisodes(_PluginBase):
             "mediaserver": "",
         }
 
+    def _generate_csv_data_url(self, table_items: List[Dict[str, Any]]) -> str:
+        """
+        纯前端 Data URI 生成：免除 API Key 鉴权失败问题
+        """
+        csv_lines = ["\ufeff剧集名称,缺失季度,缺失集号"]
+        for row in table_items:
+            series = f'"{row.get("SeriesName", "")}"'
+            season = f'"{row.get("SeasonFormatted", "")}"'
+            episodes = f'"{row.get("MissingEpisodes", "")}"'
+            csv_lines.append(f"{series},{season},{episodes}")
+        
+        csv_content = "\n".join(csv_lines)
+        encoded_csv = urllib.parse.quote(csv_content)
+        return f"data:text/csv;charset=utf-8-sig,{encoded_csv}"
+
     def get_page(self) -> List[dict]:
         """
-        拼装插件数据主页面：直接将数据序列化渲染到 UI 组件树中
+        拼装插件数据主页面：每次调用均重新读取持久化数据并渲染 UI
         """
+        # 强制从本地存储文件重新加载，不触发 Emby API 扫描
         self._load_saved_data()
 
         status_text = "后台扫描进行中..." if self._is_scanning else f"上次更新时间：{self._last_scan_time}"
 
-        # 构造渲染数据项
         table_items = []
-        for item in self._cache_missing_results:
+        for idx, item in enumerate(self._cache_missing_results, start=1):
             table_items.append({
+                "id": idx,
                 "SeriesName": str(item.get("SeriesName", "")),
                 "SeasonFormatted": str(item.get("SeasonFormatted", "")),
                 "MissingEpisodes": str(item.get("MissingEpisodes", "")),
             })
+
+        csv_data_url = self._generate_csv_data_url(table_items)
+        csv_filename = f"Emby缺集清单_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
         return [
             {
@@ -282,11 +285,25 @@ class EmbyMissingEpisodes(_PluginBase):
                                                     {
                                                         "component": "VBtn",
                                                         "props": {
+                                                            "color": "info",
+                                                            "prepend-icon": "mdi-refresh",
+                                                            "variant": "tonal",
+                                                        },
+                                                        "text": "刷新页面",
+                                                        "events": {
+                                                            "click": {
+                                                                "action": "refresh",  # 👈 纯前端组件重绘，只重读本地存储，不发起后端扫描
+                                                            }
+                                                        },
+                                                    },
+                                                    {
+                                                        "component": "VBtn",
+                                                        "props": {
                                                             "color": "success",
                                                             "prepend-icon": "mdi-download",
                                                             "variant": "tonal",
-                                                            "href": "/api/v1/plugin/EmbyMissingEpisodes/export",
-                                                            "target": "_blank",
+                                                            "href": csv_data_url,
+                                                            "download": csv_filename,
                                                         },
                                                         "text": "导出 CSV",
                                                     },
@@ -305,6 +322,7 @@ class EmbyMissingEpisodes(_PluginBase):
                             {
                                 "component": "VDataTable",
                                 "props": {
+                                    "item-value": "id",
                                     "headers": [
                                         {"title": "剧集名称", "key": "SeriesName", "align": "start"},
                                         {"title": "缺失季度", "key": "SeasonFormatted", "align": "start", "width": "120px"},
@@ -324,37 +342,6 @@ class EmbyMissingEpisodes(_PluginBase):
                 ],
             }
         ]
-
-    def api_export_csv(self) -> Any:
-        """
-        API 端点：无 Token 校验安全导出 CSV
-        """
-        self._load_saved_data()
-
-        output = io.StringIO()
-        output.write('\ufeff')
-        writer = csv.writer(output)
-
-        writer.writerow(["剧集名称", "缺失季度", "缺失集号"])
-
-        for row in self._cache_missing_results:
-            writer.writerow([
-                row.get("SeriesName", ""),
-                row.get("SeasonFormatted", ""),
-                row.get("MissingEpisodes", "")
-            ])
-
-        csv_bytes = output.getvalue().encode('utf-8-sig')
-        raw_filename = f"Emby_缺集清单_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        encoded_filename = urllib.parse.quote(raw_filename)
-
-        return Response(
-            content=csv_bytes,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f"attachment; filename=\"{encoded_filename}\"; filename*=UTF-8''{encoded_filename}",
-            }
-        )
 
     def scan_missing_episodes(self):
         """
@@ -384,7 +371,7 @@ class EmbyMissingEpisodes(_PluginBase):
             self._cache_missing_results = missing_list
             self._last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # 数据持久化
+            # 覆盖存入持久化数据文件
             self.save_data(self._STORAGE_DATA_KEY, self._cache_missing_results)
             self.save_data(self._STORAGE_TIME_KEY, self._last_scan_time)
 
@@ -400,7 +387,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _scan_server_by_diff(self, server_name: str, emby_server) -> List[Dict[str, Any]]:
         """
-        高效差集比对逻辑
+        内存高效差集比对逻辑
         """
         host = emby_server.config.config.get("host")
         api_key = emby_server.config.config.get("apikey")
@@ -439,7 +426,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
         raw_episodes = res_episodes.json().get("Items") or []
 
-        # 3. 构建 Episode 映射字典
+        # 3. 内存字典索引
         season_real_eps = defaultdict(dict)
         season_all_meta_eps = defaultdict(dict)
 
