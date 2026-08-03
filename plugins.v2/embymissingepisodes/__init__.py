@@ -8,7 +8,7 @@ from typing import Any, List, Dict, Tuple, Optional
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 
 from app.core.config import settings
 from app.helper.mediaserver import MediaServerHelper
@@ -28,9 +28,9 @@ class EmbyMissingEpisodes(_PluginBase):
     # 插件描述
     plugin_desc = "精准查找 Emby 库中剧集的缺失集情况，聚合显示并支持导出 CSV。"
     # 插件图标
-    plugin_icon = ""
+    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/emby.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.4.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -69,15 +69,7 @@ class EmbyMissingEpisodes(_PluginBase):
         self.mediaserver_helper = MediaServerHelper()
 
         # 读取持久化缓存
-        try:
-            saved_data = self.get_data(self._STORAGE_DATA_KEY)
-            saved_time = self.get_data(self._STORAGE_TIME_KEY)
-            if saved_data and isinstance(saved_data, list):
-                self._cache_missing_results = saved_data
-            if saved_time:
-                self._last_scan_time = str(saved_time)
-        except Exception as e:
-            logger.error(f"【EmbyMissingEpisodes】读取持久化数据失败: {e}")
+        self._load_saved_data()
 
         if config:
             self._enabled = config.get("enabled", False)
@@ -103,6 +95,20 @@ class EmbyMissingEpisodes(_PluginBase):
                 if self._scheduler.get_jobs():
                     self._scheduler.start()
 
+    def _load_saved_data(self):
+        """
+        显式从存储读取数据到内存
+        """
+        try:
+            saved_data = self.get_data(self._STORAGE_DATA_KEY)
+            saved_time = self.get_data(self._STORAGE_TIME_KEY)
+            if saved_data and isinstance(saved_data, list):
+                self._cache_missing_results = saved_data
+            if saved_time:
+                self._last_scan_time = str(saved_time)
+        except Exception as e:
+            logger.error(f"【EmbyMissingEpisodes】读取持久化数据失败: {e}")
+
     def get_state(self) -> bool:
         return self._enabled
 
@@ -124,14 +130,6 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
-            {
-                "path": "/data",
-                "endpoint": self.api_get_data,
-                "auth": "bear",
-                "methods": ["GET"],
-                "summary": "获取缺失结果数据",
-                "description": "获取当前扫描到的缺集列表和最后扫描时间",
-            },
             {
                 "path": "/export",
                 "endpoint": self.api_export_csv,
@@ -244,8 +242,10 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """
-        拼装插件数据主页面（UI）：支持按钮快速导出 CSV
+        拼装插件数据主页面（UI）
         """
+        self._load_saved_data()
+
         status_text = "后台扫描进行中..." if self._is_scanning else f"上次更新时间：{self._last_scan_time}"
 
         return [
@@ -289,25 +289,10 @@ class EmbyMissingEpisodes(_PluginBase):
                                                             "color": "success",
                                                             "prepend-icon": "mdi-download",
                                                             "variant": "tonal",
-                                                            "href": "plugin/EmbyMissingEpisodes/export",
+                                                            "href": "/api/v1/plugin/EmbyMissingEpisodes/export",
                                                             "target": "_blank",
                                                         },
                                                         "text": "导出 CSV",
-                                                    },
-                                                    {
-                                                        "component": "VBtn",
-                                                        "props": {
-                                                            "color": "info",
-                                                            "prepend-icon": "mdi-refresh",
-                                                            "variant": "tonal",
-                                                        },
-                                                        "text": "刷新页面",
-                                                        "events": {
-                                                            "click": {
-                                                                "api": "plugin/EmbyMissingEpisodes/data",
-                                                                "method": "get",
-                                                            }
-                                                        },
                                                     },
                                                 ],
                                             },
@@ -333,6 +318,8 @@ class EmbyMissingEpisodes(_PluginBase):
                                     "hover": True,
                                     "density": "comfortable",
                                     "items-per-page": 15,
+                                    "items-per-page-text": "每页显示条数：",  # 👈 核心修改：将 'Items per page:' 修改为中文
+                                    "page-text": "{0}-{1} 共 {2} 条",  # 可选：汉化底部的范围文本 '1-15 of 98'
                                     "no-data-text": "暂无缺失剧集数据。请在设置中选择 Emby 服务器，勾选【立即运行一次】并保存。",
                                 },
                             }
@@ -342,24 +329,12 @@ class EmbyMissingEpisodes(_PluginBase):
             }
         ]
 
-    def api_get_data(self) -> Dict[str, Any]:
-        """
-        API 端点：获取数据
-        """
-        return {
-            "code": 0,
-            "msg": "success",
-            "data": {
-                "is_scanning": self._is_scanning,
-                "last_scan_time": self._last_scan_time,
-                "items": self._cache_missing_results,
-            },
-        }
-
     def api_export_csv(self) -> Any:
         """
-        API 端点：导出 CSV 文件供浏览器直接下载（包含标准 UTF-8 BOM，彻底解决中文字符乱码问题）
+        API 端点：导出 CSV 文件
         """
+        self._load_saved_data()
+
         output = io.StringIO()
         output.write('\ufeff')  # UTF-8 BOM 标识
         writer = csv.writer(output)
@@ -373,15 +348,16 @@ class EmbyMissingEpisodes(_PluginBase):
                 row.get("MissingEpisodes", "")
             ])
 
-        output.seek(0)
+        csv_bytes = output.getvalue().encode('utf-8-sig')
         raw_filename = f"Emby_缺集清单_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         encoded_filename = urllib.parse.quote(raw_filename)
 
-        return StreamingResponse(
-            io.BytesIO(output.getvalue().encode('utf-8')),
-            media_type="text/csv; charset=utf-8",
+        return Response(
+            content=csv_bytes,
+            media_type="text/csv",
             headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+                "Content-Disposition": f"attachment; filename=\"{encoded_filename}\"; filename*=UTF-8''{encoded_filename}",
+                "Access-Control-Expose-Headers": "Content-Disposition",
             }
         )
 
@@ -410,7 +386,7 @@ class EmbyMissingEpisodes(_PluginBase):
             emby_server = list(emby_servers.values())[0]
             missing_list = self._scan_server_by_diff(self._mediaserver, emby_server)
 
-            # 运行即直接覆盖上一次的历史数据
+            # 覆盖上一次历史数据
             self._cache_missing_results = missing_list
             self._last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -430,7 +406,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _scan_server_by_diff(self, server_name: str, emby_server) -> List[Dict[str, Any]]:
         """
-        高效差集比对逻辑：按 [剧集+季度] 聚合缺少集号，顿号分割
+        高效差集比对逻辑
         """
         host = emby_server.config.config.get("host")
         api_key = emby_server.config.config.get("apikey")
@@ -505,7 +481,6 @@ class EmbyMissingEpisodes(_PluginBase):
             max_local_ep = max(real_eps_dict.keys()) if real_eps_dict else 0
             max_meta_ep = max(meta_eps_dict.keys()) if meta_eps_dict else 0
 
-            # 强化边界防护：比对最大本地集、目标 ChildCount 以及元数据中的最大集号
             total_target = max(max_local_ep, target_child_count, max_meta_ep)
 
             if total_target == 0:
