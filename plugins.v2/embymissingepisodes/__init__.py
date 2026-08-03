@@ -1,8 +1,16 @@
+import csv
 import json
-from datetime import datetime
+import io
+import urllib.parse
+from datetime import datetime, timedelta
+from collections import defaultdict
 from typing import Any, List, Dict, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi.responses import StreamingResponse
+
+from app.core.config import settings
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
@@ -12,17 +20,17 @@ from app.utils.http import RequestUtils
 
 class EmbyMissingEpisodes(_PluginBase):
     """
-    Emby 剧集缺集检查插件：快速扫描并找出 Emby 库中电视剧缺失的集/断集情况
+    Emby 剧集缺集检查插件：精简版，聚合输出剧集缺失季集情况，支持导出 CSV
     """
 
     # 插件名称
     plugin_name = "Emby剧集缺集检查"
     # 插件描述
-    plugin_desc = "精准查找 Emby 媒体库中剧集的缺失集（断集）情况。"
+    plugin_desc = "精准查找 Emby 库中剧集的缺失集情况，聚合显示并支持导出 CSV。"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/emby.png"
+    plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -34,58 +42,88 @@ class EmbyMissingEpisodes(_PluginBase):
     # 可使用的用户级别
     auth_level = 1
 
-    # 插件私有变量
+    # 插件私有属性
     _enabled = False
-    _mediaservers = []
+    _onlyonce = False
+    _mediaserver = ""
     _ignore_season_zero = True
     _ignore_future = True
-    _thread_num = 10
 
-    # 内存缓存查询结果，供前端 UI 直接拉取表格数据
+    # 持久化存储 Key 定义
+    _STORAGE_DATA_KEY = "missing_episodes_data"
+    _STORAGE_TIME_KEY = "missing_episodes_last_time"
+
+    # 内存缓存查询结果与状态
     _cache_missing_results: List[Dict[str, Any]] = []
     _last_scan_time: str = "从未扫描"
+    _is_scanning: bool = False
 
     mediaserver_helper = None
+    _scheduler: Optional[BackgroundScheduler] = None
 
     def init_plugin(self, config: dict = None):
         """
-        初始化插件配置
+        初始化插件配置与持久化加载
         """
+        self.stop_service()
         self.mediaserver_helper = MediaServerHelper()
+
+        # 读取持久化缓存
+        try:
+            saved_data = self.get_data(self._STORAGE_DATA_KEY)
+            saved_time = self.get_data(self._STORAGE_TIME_KEY)
+            if saved_data and isinstance(saved_data, list):
+                self._cache_missing_results = saved_data
+            if saved_time:
+                self._last_scan_time = str(saved_time)
+        except Exception as e:
+            logger.error(f"【EmbyMissingEpisodes】读取持久化数据失败: {e}")
 
         if config:
             self._enabled = config.get("enabled", False)
-            self._mediaservers = config.get("mediaservers") or []
+            self._onlyonce = config.get("onlyonce", False)
+            self._mediaserver = config.get("mediaserver") or ""
             self._ignore_season_zero = config.get("ignore_season_zero", True)
             self._ignore_future = config.get("ignore_future", True)
-            self._thread_num = int(config.get("thread_num") or 10)
+
+            if self._enabled and self._onlyonce:
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+
+                logger.info("【EmbyMissingEpisodes】触发“立即运行一次”，将在 3 秒后执行缺集扫描...")
+                self._scheduler.add_job(
+                    self.scan_missing_episodes,
+                    'date',
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="Emby缺集扫描"
+                )
+
+                self._onlyonce = False
+                self.__update_config()
+
+                if self._scheduler.get_jobs():
+                    self._scheduler.start()
 
     def get_state(self) -> bool:
-        """
-        返回插件启用状态
-        """
         return self._enabled
+
+    def __update_config(self):
+        """
+        更新插件持久化配置
+        """
+        self.update_config({
+            "enabled": self._enabled,
+            "onlyonce": self._onlyonce,
+            "mediaserver": self._mediaserver,
+            "ignore_season_zero": self._ignore_season_zero,
+            "ignore_future": self._ignore_future,
+        })
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        """
-        快捷指令（无）
-        """
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """
-        注册插件后端 API 端点，供前端 get_page 中的 UI 组件异步调用
-        """
         return [
-            {
-                "path": "/scan",
-                "endpoint": self.api_scan_missing,
-                "auth": "bear",
-                "methods": ["POST"],
-                "summary": "执行缺集扫描",
-                "description": "扫描选中的 Emby 服务器并提取所有缺失的剧集列表",
-            },
             {
                 "path": "/data",
                 "endpoint": self.api_get_data,
@@ -93,6 +131,14 @@ class EmbyMissingEpisodes(_PluginBase):
                 "methods": ["GET"],
                 "summary": "获取缺失结果数据",
                 "description": "获取当前扫描到的缺集列表和最后扫描时间",
+            },
+            {
+                "path": "/export",
+                "endpoint": self.api_export_csv,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "导出 CSV",
+                "description": "导出缺失剧集结果为 CSV 文件",
             },
         ]
 
@@ -127,8 +173,21 @@ class EmbyMissingEpisodes(_PluginBase):
                                     {
                                         "component": "VSwitch",
                                         "props": {
+                                            "model": "onlyonce",
+                                            "label": "立即运行一次",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
                                             "model": "ignore_season_zero",
-                                            "label": "忽略特别篇 (S00/SP)",
+                                            "label": "忽略特别篇 (S0/SP)",
                                         },
                                     }
                                 ],
@@ -146,21 +205,6 @@ class EmbyMissingEpisodes(_PluginBase):
                                     }
                                 ],
                             },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "thread_num",
-                                            "label": "扫描并发线程数",
-                                            "placeholder": "默认10",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
                         ],
                     },
                     {
@@ -173,10 +217,9 @@ class EmbyMissingEpisodes(_PluginBase):
                                     {
                                         "component": "VSelect",
                                         "props": {
-                                            "multiple": True,
-                                            "chips": True,
+                                            "multiple": False,
                                             "clearable": True,
-                                            "model": "mediaservers",
+                                            "model": "mediaserver",
                                             "label": "选择 Emby 媒体服务器",
                                             "items": [
                                                 {"title": config.name, "value": config.name}
@@ -193,21 +236,22 @@ class EmbyMissingEpisodes(_PluginBase):
             }
         ], {
             "enabled": False,
+            "onlyonce": False,
             "ignore_season_zero": True,
             "ignore_future": True,
-            "thread_num": 10,
-            "mediaservers": [],
+            "mediaserver": "",
         }
 
     def get_page(self) -> List[dict]:
         """
-        拼装插件数据主页面（UI）：展示扫描统计卡片与缺失剧集 Data Table 数据表格
+        拼装插件数据主页面（UI）：支持按钮快速导出 CSV
         """
+        status_text = "后台扫描进行中..." if self._is_scanning else f"上次更新时间：{self._last_scan_time}"
+
         return [
             {
                 "component": "VRow",
                 "content": [
-                    # 1. 顶部操作面板与状态统计卡片
                     {
                         "component": "VCol",
                         "props": {"cols": 12},
@@ -231,24 +275,41 @@ class EmbyMissingEpisodes(_PluginBase):
                                                     {
                                                         "component": "div",
                                                         "props": {"class": "text-caption text-medium-emphasis mt-1"},
-                                                        "text": f"上次更新时间：{self._last_scan_time} | 共发现缺集数量：{len(self._cache_missing_results)} 条",
+                                                        "text": f"{status_text} | 缺失项：{len(self._cache_missing_results)} 条",
                                                     },
                                                 ],
                                             },
                                             {
-                                                "component": "VBtn",
-                                                "props": {
-                                                    "color": "primary",
-                                                    "prepend-icon": "mdi-magnify-scan",
-                                                    "size": "large",
-                                                },
-                                                "text": "立即重新扫描缺集",
-                                                "events": {
-                                                    "click": {
-                                                        "api": "plugin/EmbyMissingEpisodes/scan",
-                                                        "method": "post",
-                                                    }
-                                                },
+                                                "component": "div",
+                                                "props": {"class": "d-flex gap-2"},
+                                                "content": [
+                                                    {
+                                                        "component": "VBtn",
+                                                        "props": {
+                                                            "color": "success",
+                                                            "prepend-icon": "mdi-download",
+                                                            "variant": "tonal",
+                                                            "href": "plugin/EmbyMissingEpisodes/export",
+                                                            "target": "_blank",
+                                                        },
+                                                        "text": "导出 CSV",
+                                                    },
+                                                    {
+                                                        "component": "VBtn",
+                                                        "props": {
+                                                            "color": "info",
+                                                            "prepend-icon": "mdi-refresh",
+                                                            "variant": "tonal",
+                                                        },
+                                                        "text": "刷新页面",
+                                                        "events": {
+                                                            "click": {
+                                                                "api": "plugin/EmbyMissingEpisodes/data",
+                                                                "method": "get",
+                                                            }
+                                                        },
+                                                    },
+                                                ],
                                             },
                                         ],
                                     }
@@ -256,34 +317,24 @@ class EmbyMissingEpisodes(_PluginBase):
                             }
                         ],
                     },
-                    # 2. 缺集详情数据表格
                     {
                         "component": "VCol",
                         "props": {"cols": 12},
                         "content": [
                             {
-                                "component": "VCard",
-                                "props": {"variant": "outlined"},
-                                "content": [
-                                    {
-                                        "component": "VDataTable",
-                                        "props": {
-                                            "headers": [
-                                                {"title": "服务器", "key": "ServerName", "width": "120px"},
-                                                {"title": "剧集名称", "key": "SeriesName", "width": "220px"},
-                                                {"title": "缺失季度", "key": "SeasonFormatted", "width": "100px"},
-                                                {"title": "缺失集号", "key": "EpisodeFormatted", "width": "120px"},
-                                                {"title": "缺失标题", "key": "Name"},
-                                                {"title": "首播日期", "key": "PremiereDate", "width": "150px"},
-                                            ],
-                                            "items": self._cache_missing_results,
-                                            "hover": True,
-                                            "density": "comfortable",
-                                            "items-per-page": 15,
-                                            "no-data-text": "暂无缺失剧集数据，请点击上方按钮发起扫描。",
-                                        },
-                                    }
-                                ],
+                                "component": "VDataTable",
+                                "props": {
+                                    "headers": [
+                                        {"title": "剧集名称", "key": "SeriesName", "width": "300px"},
+                                        {"title": "缺失季度", "key": "SeasonFormatted", "width": "120px"},
+                                        {"title": "缺失集号", "key": "MissingEpisodes"},
+                                    ],
+                                    "items": self._cache_missing_results,
+                                    "hover": True,
+                                    "density": "comfortable",
+                                    "items-per-page": 15,
+                                    "no-data-text": "暂无缺失剧集数据。请在设置中选择 Emby 服务器，勾选【立即运行一次】并保存。",
+                                },
                             }
                         ],
                     },
@@ -291,101 +342,207 @@ class EmbyMissingEpisodes(_PluginBase):
             }
         ]
 
-    def api_scan_missing(self) -> Dict[str, Any]:
-        """
-        API 端点：触发缺集扫描逻辑
-        """
-        try:
-            if not self._enabled:
-                return {"code": 1, "msg": "插件未启用，请先在配置页面启用插件并保存。"}
-
-            emby_servers = self.mediaserver_helper.get_services(name_filters=self._mediaservers, type_filter="emby")
-            if not emby_servers:
-                return {"code": 1, "msg": "未配置有效 Emby 媒体服务器。"}
-
-            all_missing = []
-
-            for emby_name, emby_server in emby_servers.items():
-                logger.info(f"【EmbyMissingEpisodes】开始扫描服务器: {emby_name}")
-                missing_list = self._scan_server_missing_episodes(emby_name, emby_server)
-                all_missing.extend(missing_list)
-
-            self._cache_missing_results = all_missing
-            self._last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            logger.info(f"【EmbyMissingEpisodes】扫描完成，共获取到 {len(all_missing)} 条缺集记录。")
-            return {
-                "code": 0,
-                "msg": f"扫描完成，共找到 {len(all_missing)} 条缺集信息。",
-                "data": all_missing,
-            }
-        except Exception as e:
-            logger.error(f"【EmbyMissingEpisodes】扫描过程出现异常: {e}", exc_info=True)
-            return {"code": 1, "msg": f"扫描失败: {str(e)}"}
-
     def api_get_data(self) -> Dict[str, Any]:
         """
-        API 端点：获取数据接口
+        API 端点：获取数据
         """
         return {
             "code": 0,
             "msg": "success",
             "data": {
+                "is_scanning": self._is_scanning,
                 "last_scan_time": self._last_scan_time,
                 "items": self._cache_missing_results,
             },
         }
 
-    def _scan_server_missing_episodes(self, server_name: str, emby_server) -> List[Dict[str, Any]]:
+    def api_export_csv(self) -> Any:
         """
-        扫描单个 Emby 服务器的缺集逻辑（利用 IsMissing=true 方案与差集算法结合）
+        API 端点：导出 CSV 文件供浏览器直接下载（包含标准 UTF-8 BOM，彻底解决中文字符乱码问题）
+        """
+        output = io.StringIO()
+        output.write('\ufeff')  # UTF-8 BOM 标识
+        writer = csv.writer(output)
+
+        writer.writerow(["剧集名称", "缺失季度", "缺失集号"])
+
+        for row in self._cache_missing_results:
+            writer.writerow([
+                row.get("SeriesName", ""),
+                row.get("SeasonFormatted", ""),
+                row.get("MissingEpisodes", "")
+            ])
+
+        output.seek(0)
+        raw_filename = f"Emby_缺集清单_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        encoded_filename = urllib.parse.quote(raw_filename)
+
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode('utf-8')),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+            }
+        )
+
+    def scan_missing_episodes(self):
+        """
+        异步后台执行扫描的任务函数
+        """
+        if self._is_scanning:
+            logger.warn("【EmbyMissingEpisodes】上一次扫描任务尚未完成，跳过本次执行。")
+            return
+
+        self._is_scanning = True
+        start_time = datetime.now()
+        logger.info("【EmbyMissingEpisodes】开始缺集扫描...")
+
+        try:
+            if not self._mediaserver:
+                logger.error("【EmbyMissingEpisodes】未选择 Emby 媒体服务器！")
+                return
+
+            emby_servers = self.mediaserver_helper.get_services(name_filters=[self._mediaserver], type_filter="emby")
+            if not emby_servers:
+                logger.error(f"【EmbyMissingEpisodes】未找到匹配的 Emby 服务器: {self._mediaserver}")
+                return
+
+            emby_server = list(emby_servers.values())[0]
+            missing_list = self._scan_server_by_diff(self._mediaserver, emby_server)
+
+            # 运行即直接覆盖上一次的历史数据
+            self._cache_missing_results = missing_list
+            self._last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 持久化存储
+            self.save_data(self._STORAGE_DATA_KEY, self._cache_missing_results)
+            self.save_data(self._STORAGE_TIME_KEY, self._last_scan_time)
+
+            elapsed_seconds = (datetime.now() - start_time).total_seconds()
+            logger.info(
+                f"【EmbyMissingEpisodes】>>> 扫描完成！耗时 {elapsed_seconds:.2f} 秒，"
+                f"找到 {len(missing_list)} 季存在缺集，已覆盖存入本地持久化存储。"
+            )
+        except Exception as e:
+            logger.error(f"【EmbyMissingEpisodes】扫描过程出现异常: {e}", exc_info=True)
+        finally:
+            self._is_scanning = False
+
+    def _scan_server_by_diff(self, server_name: str, emby_server) -> List[Dict[str, Any]]:
+        """
+        高效差集比对逻辑：按 [剧集+季度] 聚合缺少集号，顿号分割
         """
         host = emby_server.config.config.get("host")
         api_key = emby_server.config.config.get("apikey")
         user_id = emby_server.instance.get_user()
 
-        results = []
-        now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+        if not host or not api_key or not user_id:
+            return []
 
-        # 优先通过 API 直接获取 Emby 已标出缺失的 Virtual 节点
-        url = (
+        today_date_str = datetime.now().strftime("%Y-%m-%d")
+
+        # 1. 获取 Season 列表
+        seasons_url = (
             f"{host}/emby/Users/{user_id}/Items?"
-            f"Recursive=true&IncludeItemTypes=Episode&IsMissing=true"
-            f"&Fields=SeriesName,SeasonName,IndexNumber,ParentIndexNumber,PremiereDate"
+            f"Recursive=true&IncludeItemTypes=Season"
+            f"&Fields=SeriesName,SeriesId,IndexNumber,ChildCount"
             f"&api_key={api_key}"
         )
+        res_seasons = RequestUtils().get_res(seasons_url)
+        if not res_seasons or res_seasons.status_code != 200:
+            logger.error(f"【EmbyMissingEpisodes】[{server_name}] 拉取 Season 列表失败！")
+            return []
 
-        res = RequestUtils().get_res(url)
-        if res and res.status_code == 200:
-            raw_items = res.json().get("Items") or []
-            for item in raw_items:
-                season_num = item.get("ParentIndexNumber", 1)
-                episode_num = item.get("IndexNumber", 0)
-                premiere_date = item.get("PremiereDate", "")
+        raw_seasons = res_seasons.json().get("Items") or []
 
-                # 排除规则 1：排除 S00 特别篇
-                if self._ignore_season_zero and season_num == 0:
-                    continue
+        # 2. 获取 Episode 列表
+        episodes_url = (
+            f"{host}/emby/Users/{user_id}/Items?"
+            f"Recursive=true&IncludeItemTypes=Episode"
+            f"&Fields=IndexNumber,ParentIndexNumber,LocationType,ParentId,PremiereDate"
+            f"&api_key={api_key}"
+        )
+        res_episodes = RequestUtils().get_res(episodes_url)
+        if not res_episodes or res_episodes.status_code != 200:
+            logger.error(f"【EmbyMissingEpisodes】[{server_name}] 拉取 Episode 列表失败！")
+            return []
 
-                # 排除规则 2：排除尚未首播开播的未来剧集
-                if self._ignore_future and premiere_date and premiere_date > now_str:
-                    continue
+        raw_episodes = res_episodes.json().get("Items") or []
 
-                formatted_date = premiere_date[:10] if len(premiere_date) >= 10 else "未知"
+        # 3. 内存字典索引
+        season_real_eps = defaultdict(dict)
+        season_all_meta_eps = defaultdict(dict)
 
-                results.append({
-                    "ServerName": server_name,
-                    "SeriesName": item.get("SeriesName") or "未知剧集",
-                    "SeasonFormatted": f"第 {season_num} 季" if season_num > 0 else "特别篇",
-                    "EpisodeFormatted": f"第 {episode_num} 集" if episode_num > 0 else "未知",
-                    "Name": item.get("Name") or f"第 {episode_num} 集",
-                    "PremiereDate": formatted_date,
+        for ep in raw_episodes:
+            season_id = ep.get("ParentId")
+            ep_num = ep.get("IndexNumber")
+            premiere_date = ep.get("PremiereDate", "")
+
+            if not season_id or ep_num is None:
+                continue
+
+            season_all_meta_eps[season_id][ep_num] = premiere_date
+
+            if ep.get("LocationType") != "Virtual":
+                season_real_eps[season_id][ep_num] = premiere_date
+
+        missing_results = []
+
+        # 4. 遍历 Seasons 聚合缺集
+        for season_item in raw_seasons:
+            season_id = season_item.get("Id")
+            series_name = season_item.get("SeriesName") or "未知剧集"
+            season_num = int(season_item.get("IndexNumber") if season_item.get("IndexNumber") is not None else 1)
+            target_child_count = int(season_item.get("ChildCount") if season_item.get("ChildCount") is not None else 0)
+
+            # 忽略特别篇
+            if self._ignore_season_zero and season_num == 0:
+                continue
+
+            real_eps_dict = season_real_eps.get(season_id, {})
+            meta_eps_dict = season_all_meta_eps.get(season_id, {})
+
+            max_local_ep = max(real_eps_dict.keys()) if real_eps_dict else 0
+            max_meta_ep = max(meta_eps_dict.keys()) if meta_eps_dict else 0
+
+            # 强化边界防护：比对最大本地集、目标 ChildCount 以及元数据中的最大集号
+            total_target = max(max_local_ep, target_child_count, max_meta_ep)
+
+            if total_target == 0:
+                continue
+
+            missing_ep_numbers = []
+
+            for i in range(1, total_target + 1):
+                if i not in real_eps_dict:
+                    ep_premiere_date = meta_eps_dict.get(i, "")
+                    formatted_date = ep_premiere_date[:10] if len(ep_premiere_date) >= 10 else "未知/未开播"
+
+                    # 忽略未上映剧集
+                    if self._ignore_future and formatted_date != "未知/未开播" and formatted_date > today_date_str:
+                        continue
+
+                    missing_ep_numbers.append(str(i))
+
+            if missing_ep_numbers:
+                season_display = f"S{season_num}" if season_num > 0 else "SP"
+                missing_results.append({
+                    "SeriesName": series_name,
+                    "SeasonFormatted": season_display,
+                    "MissingEpisodes": "、".join(missing_ep_numbers),
                 })
 
-        return results
+        return missing_results
 
     def stop_service(self):
         """
-        插件停止事件清理逻辑
+        停止任务清理
         """
-        pass
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as e:
+            logger.error(f"【EmbyMissingEpisodes】停止服务失败: {e}")
