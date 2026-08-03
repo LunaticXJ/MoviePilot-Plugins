@@ -2,6 +2,7 @@ import json
 import threading
 from datetime import datetime, timedelta
 from typing import Optional, Any, List, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,7 +14,6 @@ from app.plugins import _PluginBase
 from app.schemas.types import EventType
 from app.utils.http import RequestUtils
 
-lock = threading.Lock()
 
 class EmbyLatestMediaSort(_PluginBase):
     # 插件名称
@@ -23,7 +23,7 @@ class EmbyLatestMediaSort(_PluginBase):
     # 插件图标
     plugin_icon = "Element_A.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -38,6 +38,7 @@ class EmbyLatestMediaSort(_PluginBase):
     # 私有属性
     _mediaservers = None
     _media_types = None
+    _thread_num = 10  # 默认并发线程数
     _batch_size = 1000  # 每批次查询数量
     _default_premiere_date = "2000-01-01T00:00:00.0000000Z"  # 默认PremiereDate
 
@@ -53,6 +54,8 @@ class EmbyLatestMediaSort(_PluginBase):
             self._onlyonce = config.get("onlyonce")
             self._mediaservers = config.get("mediaservers") or []
             self._media_types = config.get("media_types") or []
+            # 获取配置的并发线程数，默认为 10
+            self._thread_num = int(config.get("thread_num") or 10)
 
             # 加载模块
             if self._onlyonce:
@@ -60,18 +63,17 @@ class EmbyLatestMediaSort(_PluginBase):
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
 
                 # 立即运行一次
-                if self._onlyonce:
-                    logger.info(f"Emby媒体排序刷新服务启动，立即运行一次")
-                    self._scheduler.add_job(self.collection_sort, 'date',
-                                            run_date=datetime.now(
-                                                tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                            name="Emby媒体排序")
+                logger.info(f"Emby媒体排序刷新服务启动，立即运行一次")
+                self._scheduler.add_job(self.collection_sort, 'date',
+                                        run_date=datetime.now(
+                                            tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                        name="Emby媒体排序")
 
-                    # 关闭一次性开关
-                    self._onlyonce = False
+                # 关闭一次性开关
+                self._onlyonce = False
 
-                    # 保存配置
-                    self.__update_config()
+                # 保存配置
+                self.__update_config()
 
                 # 启动任务
                 if self._scheduler.get_jobs():
@@ -87,6 +89,7 @@ class EmbyLatestMediaSort(_PluginBase):
                 "onlyonce": self._onlyonce,
                 "mediaservers": self._mediaservers,
                 "media_types": self._media_types,
+                "thread_num": self._thread_num,
             }
         )
 
@@ -103,18 +106,17 @@ class EmbyLatestMediaSort(_PluginBase):
             logger.error("未配置要处理的媒体类型")
             return
 
-
         for emby_name, emby_server in emby_servers.items():
-            logger.info(f"开始处理媒体服务器 {emby_name}")
+            logger.info(f"开始处理媒体服务器 {emby_name}，当前并发线程数：{self._thread_num}")
 
             for media_type in self._media_types:
                 logger.info(f"开始处理媒体类型: {media_type}")
                 start_index = 0
                 total_count = None
-                success_items = []
+                total_success_count = 0
 
                 while total_count is None or start_index < total_count:
-                    # 分批查询
+                    # 分批查询（直接带出 PremiereDate, DateCreated 字段，无需二次查询详情）
                     items = self.__get_items(emby_server=emby_server, media_type=media_type, start_index=start_index, limit=self._batch_size)
                     if not items:
                         logger.info(f"未获取到{media_type}信息，start_index={start_index}")
@@ -124,63 +126,75 @@ class EmbyLatestMediaSort(_PluginBase):
                         total_count = self.__get_total_items(emby_server=emby_server, media_type=media_type)
                         logger.info(f"总计需要处理 {total_count} 条{media_type}信息")
 
-                    item_dict = []
+                    # 筛选需要更新的媒体项
+                    to_update_items = []
+                    skipped_count = 0
+
                     for item in items:
-                        item_info = self.__get_item_info(emby_server=emby_server, item_id=item.get("Id"))
-                        item_dict.append({"Name": item.get("Name"), "Id": item.get("Id"), "item_info": item_info})
+                        premiere_date = item.get("PremiereDate") or self._default_premiere_date
+                        date_created = item.get("DateCreated")
 
-                    if not item_dict:
-                        logger.info(f"当前{media_type}批次（start_index={start_index}）无有效信息，跳过")
+                        if premiere_date == date_created:
+                            skipped_count += 1
+                            continue
+
+                        # 需要更新，直接使用现有的 item 字典修改字段
+                        item["DateCreated"] = premiere_date
+                        to_update_items.append(item)
+
+                        if premiere_date == self._default_premiere_date:
+                            logger.info(f"{item.get('Name')} ({media_type}) 缺失PremiereDate，使用默认日期 {premiere_date}")
+
+                    if skipped_count > 0:
+                        logger.info(f"当前批次（start_index={start_index}）跳过 {skipped_count} 条时间相同的记录")
+
+                    if not to_update_items:
+                        logger.info(f"当前批次（start_index={start_index}）无需更新入库时间")
                         start_index += self._batch_size
                         continue
 
-                    # 处理当前批次
-                    updated_items = []
-                    for item in item_dict:
-                        with lock:
-                            premiere_date = item["item_info"].get("PremiereDate", self._default_premiere_date)
-                            if premiere_date == item["item_info"].get("DateCreated"):
-                                logger.info(
-                                    f"{item.get('Name')} ({media_type}) 原入库时间与发布日期相同，跳过")
-                                continue
+                    # 使用多线程并发写回更新
+                    batch_success = 0
+                    with ThreadPoolExecutor(max_workers=self._thread_num) as executor:
+                        future_to_item = {
+                            executor.submit(self.__update_item_info, emby_server, item.get("Id"), item): item
+                            for item in to_update_items
+                        }
 
-                            item["item_info"]["DateCreated"] = premiere_date
-                            updated_items.append(item["item_info"])
-                            if premiere_date == self._default_premiere_date:
-                                logger.info(f"{item.get('Name')} ({media_type}) 缺失PremiereDate，使用默认日期 {premiere_date}")
+                        for future in as_completed(future_to_item):
+                            item_info = future_to_item[future]
+                            try:
+                                if future.result():
+                                    logger.info(f"{item_info.get('Name')} ({media_type}) 更新入库时间到 {item_info.get('DateCreated')} 成功")
+                                    batch_success += 1
+                                else:
+                                    logger.error(f"{item_info.get('Name')} ({media_type}) 更新入库时间到 {item_info.get('DateCreated')} 失败")
+                            except Exception as e:
+                                logger.error(f"{item_info.get('Name')} ({media_type}) 更新异常：{str(e)}")
 
-                    if not updated_items:
-                        logger.info(f"当前{media_type}批次（start_index={start_index}）无需更新入库时间")
-                        start_index += self._batch_size
-                        continue
-
-                    # 更新入库时间
-                    for item_info in updated_items:
-                        update_flag = self.__update_item_info(emby_server=emby_server, item_id=item_info.get("Id"), data=item_info)
-                        if update_flag:
-                            logger.info(f"{item_info.get('Name')} ({media_type}) 更新入库时间到{item_info.get('DateCreated')}成功")
-                            success_items.append(item_info)
-                        else:
-                            logger.error(f"{item_info.get('Name')} ({media_type}) 更新入库时间到{item_info.get('DateCreated')}失败")
-
-                    logger.info(f"{media_type}批次处理完成（start_index={start_index}，数量={len(items)}）")
+                    total_success_count += batch_success
+                    logger.info(f"{media_type}批次处理完成（start_index={start_index}，本次更新成功={batch_success}/{len(to_update_items)}）")
                     start_index += self._batch_size
 
-                logger.info(f"更新 {emby_name} {media_type} 排序完成，总计处理成功 {len(success_items)} 条记录")
+                logger.info(f"更新 {emby_name} {media_type} 排序完成，总计成功更新 {total_success_count} 条记录")
 
     def __get_items(self, emby_server, media_type: str, start_index: int = 0, limit: int = 1000):
         """
-        获取指定类型的媒体项
+        获取指定类型的媒体项（一次性带上 PremiereDate 和 DateCreated 字段）
         """
         host = emby_server.config.config.get("host")
         api_key = emby_server.config.config.get("apikey")
         user_id = emby_server.instance.get_user()
 
-        res = RequestUtils().get_res(
-            f"{host}/emby/Users/{user_id}/Items?Recursive=true&IncludeItemTypes={media_type}&StartIndex={start_index}&Limit={limit}&api_key={api_key}")
+        # 重点优化：添加 Fields=PremiereDate,DateCreated 参数，避免全库频繁调用单条详情 API
+        url = (f"{host}/emby/Users/{user_id}/Items?"
+               f"Recursive=true&IncludeItemTypes={media_type}"
+               f"&Fields=PremiereDate,DateCreated"
+               f"&StartIndex={start_index}&Limit={limit}&api_key={api_key}")
+
+        res = RequestUtils().get_res(url)
         if res and res.status_code == 200:
-            results = res.json().get("Items") or []
-            return results
+            return res.json().get("Items") or []
         return []
 
     def __get_total_items(self, emby_server, media_type: str):
@@ -196,20 +210,6 @@ class EmbyLatestMediaSort(_PluginBase):
         if res and res.status_code == 200:
             return res.json().get("TotalRecordCount", 0)
         return 0
-
-    def __get_item_info(self, emby_server, item_id):
-        """
-        获取单个媒体项的详细信息
-        """
-        host = emby_server.config.config.get("host")
-        api_key = emby_server.config.config.get("apikey")
-        user_id = emby_server.instance.get_user()
-
-        res = RequestUtils().get_res(
-            f"{host}/emby/Users/{user_id}/Items/{item_id}?api_key={api_key}")
-        if res and res.status_code == 200:
-            return res.json()
-        return {}
 
     def __update_item_info(self, emby_server, item_id, data):
         """
@@ -246,7 +246,7 @@ class EmbyLatestMediaSort(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
-        拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
+        拼装插件配置页面
         """
         return [
             {
@@ -259,7 +259,7 @@ class EmbyLatestMediaSort(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -275,7 +275,25 @@ class EmbyLatestMediaSort(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'thread_num',
+                                            'label': '并发更新线程数',
+                                            'placeholder': '默认10',
+                                            'type': 'number'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -297,7 +315,7 @@ class EmbyLatestMediaSort(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -322,6 +340,7 @@ class EmbyLatestMediaSort(_PluginBase):
             }
         ], {
             "onlyonce": False,
+            "thread_num": 10,
             "mediaservers": [],
             "media_types": [],
         }
