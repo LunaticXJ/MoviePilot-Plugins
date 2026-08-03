@@ -1,17 +1,4 @@
 {
-  "StrmGenerator": {
-    "name": "115云盘Strm助手",
-    "description": "115云盘全量快速生成工具，并可实时处理MP新整理入库的文件。",
-    "labels": "云盘",
-    "version": "3.1.3",
-    "icon": "https://raw.githubusercontent.com/LunaticXJ/MoviePilot-Plugins/main/icons/115strm.png",
-    "author": "LunaticXJ",
-    "level": 1,
-    "history": {
-      "v3.1.1": "新增云盘文件同步删除功能",
-      "v3.0.0": "支持全量定时快速生成和基于整理事件增量实时生成"
-    }
-  },
   "EmbyLatestMediaSort": {
     "name": "Emby最新媒体排序",
     "description": "将Emby媒体加入时间设置为发布时间，让首页最新媒体列表按发布日期倒序排列。",
@@ -25,6 +12,18 @@
       "v1.1.0": "优化性能",
       "v1.2.0": "修改BUG",
       "v1.3.0": "进一步提升性能"
+    }
+  },
+  "EmbyMissingEpisodes": {
+    "name": "Emby剧集缺集检查",
+    "description": "精准扫描并找出 Emby 库中电视剧缺失的集/断集情况，支持界面化数据看板展示。",
+    "labels": "媒体库,工具",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/emby.png",
+    "author": "LunaticXJ",
+    "level": 1,
+    "history": {
+      "v1.0.0": "新增：支持多服务器扫描、忽略 S00/未上映剧集及数据看板展示"
     }
   }
 }
