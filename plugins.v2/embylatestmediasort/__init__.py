@@ -23,7 +23,7 @@ class EmbyLatestMediaSort(_PluginBase):
     # 插件图标
     plugin_icon = "Element_A.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -116,7 +116,7 @@ class EmbyLatestMediaSort(_PluginBase):
                 total_success_count = 0
 
                 while total_count is None or start_index < total_count:
-                    # 1. 批量快速查询列表（轻量级带出 PremiereDate, DateCreated 字段）
+                    # 1. 批量快速查询列表（带入必要字段，显式 DateCreated 倒序排列）
                     items = self.__get_items(emby_server=emby_server, media_type=media_type, start_index=start_index, limit=self._batch_size)
                     if not items:
                         logger.info(f"未获取到{media_type}信息，start_index={start_index}")
@@ -148,15 +148,20 @@ class EmbyLatestMediaSort(_PluginBase):
                         if premiere_date == self._default_premiere_date:
                             logger.info(f"{item.get('Name')} ({media_type}) 缺失PremiereDate，使用默认日期 {premiere_date}")
 
+                    # 🚀 提前终止判断（哨兵校验机制）：
+                    # 如果当前批次中的所有数据都已经对齐，说明后续更早入库的历史数据也已全部对齐，安全终止循环。
+                    if skipped_count == len(items):
+                        logger.info(f"当前批次（start_index={start_index}）数据已全部是对齐状态，触发展开安全终止，跳过后续历史批次！")
+                        break
+
                     if skipped_count > 0:
                         logger.info(f"当前批次（start_index={start_index}）跳过 {skipped_count} 条时间相同的记录")
 
                     if not items_to_process:
-                        logger.info(f"当前批次（start_index={start_index}）无需更新入库时间")
                         start_index += self._batch_size
                         continue
 
-                    # 3. 使用多线程并发：获取完整元数据 -> 修改时间 -> 发送更新请求
+                    # 3. 多线程并发：拉取完整元数据 -> 赋予新时间 -> 推送更新
                     batch_success = 0
                     with ThreadPoolExecutor(max_workers=self._thread_num) as executor:
                         future_to_item = {
@@ -198,7 +203,7 @@ class EmbyLatestMediaSort(_PluginBase):
 
     def __get_items(self, emby_server, media_type: str, start_index: int = 0, limit: int = 1000):
         """
-        获取指定类型的媒体项（仅用于快速比对）
+        获取指定类型的媒体项（显式指定按 DateCreated 倒序排列，带出 PremiereDate, DateCreated 字段）
         """
         host = emby_server.config.config.get("host")
         api_key = emby_server.config.config.get("apikey")
@@ -206,6 +211,7 @@ class EmbyLatestMediaSort(_PluginBase):
 
         url = (f"{host}/emby/Users/{user_id}/Items?"
                f"Recursive=true&IncludeItemTypes={media_type}"
+               f"&SortBy=DateCreated&SortOrder=Descending"
                f"&Fields=PremiereDate,DateCreated"
                f"&StartIndex={start_index}&Limit={limit}&api_key={api_key}")
 
