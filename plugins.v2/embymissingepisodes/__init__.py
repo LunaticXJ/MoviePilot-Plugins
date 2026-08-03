@@ -1,4 +1,6 @@
+import csv
 import json
+import io
 import urllib.parse
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -17,17 +19,17 @@ from app.utils.http import RequestUtils
 
 class EmbyMissingEpisodes(_PluginBase):
     """
-    Emby 剧集缺集检查插件：极简版，聚合显示缺失季集，纯本地重新加载刷新与 CSV 免鉴权导出
+    Emby 剧集缺集检查插件：极简聚合版，彻底解决误报、表格渲染与 CSV 免鉴权导出问题
     """
 
     # 插件名称
     plugin_name = "Emby剧集缺集检查"
     # 插件描述
     plugin_desc = "精准查找 Emby 库中剧集的缺失集情况，聚合显示并支持导出 CSV。"
-    # 插件图标
+    # 插件图标 (已设为空)
     plugin_icon = ""
     # 插件版本
-    plugin_version = "3.3.0"
+    plugin_version = "3.5.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -59,12 +61,12 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def init_plugin(self, config: dict = None):
         """
-        初始化插件配置与历史数据重载
+        初始化插件配置与历史数据加载
         """
         self.stop_service()
         self.mediaserver_helper = MediaServerHelper()
 
-        # 读取历史保存的数据
+        # 显式读取历史保存的数据
         self._load_saved_data()
 
         if config:
@@ -92,7 +94,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _load_saved_data(self):
         """
-        仅从本地持久化存储（文件/数据库）重新加载数据到内存
+        从存储读取历史数据
         """
         try:
             saved_data = self.get_data(self._STORAGE_DATA_KEY)
@@ -127,7 +129,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
-        配置页面
+        极简配置页面：只保留单选服务器与立即运行一次
         """
         return [
             {
@@ -228,9 +230,8 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """
-        拼装插件数据主页面：每次调用均重新读取持久化数据并渲染 UI
+        拼装插件数据主页面：同时注入 key 与 value 字段确保 Vue 3 渲染无误
         """
-        # 强制从本地存储文件重新加载，不触发 Emby API 扫描
         self._load_saved_data()
 
         status_text = "后台扫描进行中..." if self._is_scanning else f"上次更新时间：{self._last_scan_time}"
@@ -238,7 +239,7 @@ class EmbyMissingEpisodes(_PluginBase):
         table_items = []
         for idx, item in enumerate(self._cache_missing_results, start=1):
             table_items.append({
-                "id": idx,
+                "id": str(idx),
                 "SeriesName": str(item.get("SeriesName", "")),
                 "SeasonFormatted": str(item.get("SeasonFormatted", "")),
                 "MissingEpisodes": str(item.get("MissingEpisodes", "")),
@@ -292,7 +293,7 @@ class EmbyMissingEpisodes(_PluginBase):
                                                         "text": "刷新页面",
                                                         "events": {
                                                             "click": {
-                                                                "action": "refresh",  # 👈 纯前端组件重绘，只重读本地存储，不发起后端扫描
+                                                                "action": "refresh",
                                                             }
                                                         },
                                                     },
@@ -324,9 +325,9 @@ class EmbyMissingEpisodes(_PluginBase):
                                 "props": {
                                     "item-value": "id",
                                     "headers": [
-                                        {"title": "剧集名称", "key": "SeriesName", "align": "start"},
-                                        {"title": "缺失季度", "key": "SeasonFormatted", "align": "start", "width": "120px"},
-                                        {"title": "缺失集号", "key": "MissingEpisodes", "align": "start"},
+                                        {"title": "剧集名称", "key": "SeriesName", "value": "SeriesName", "align": "start"},
+                                        {"title": "缺失季度", "key": "SeasonFormatted", "value": "SeasonFormatted", "align": "start", "width": "120px"},
+                                        {"title": "缺失集号", "key": "MissingEpisodes", "value": "MissingEpisodes", "align": "start"},
                                     ],
                                     "items": table_items,
                                     "hover": True,
@@ -371,7 +372,7 @@ class EmbyMissingEpisodes(_PluginBase):
             self._cache_missing_results = missing_list
             self._last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # 覆盖存入持久化数据文件
+            # 数据持久化
             self.save_data(self._STORAGE_DATA_KEY, self._cache_missing_results)
             self.save_data(self._STORAGE_TIME_KEY, self._last_scan_time)
 
@@ -387,7 +388,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _scan_server_by_diff(self, server_name: str, emby_server) -> List[Dict[str, Any]]:
         """
-        内存高效差集比对逻辑
+        精准差集算法：多重防御彻底杜绝误报
         """
         host = emby_server.config.config.get("host")
         api_key = emby_server.config.config.get("apikey")
@@ -462,9 +463,13 @@ class EmbyMissingEpisodes(_PluginBase):
             max_local_ep = max(real_eps_dict.keys()) if real_eps_dict else 0
             max_meta_ep = max(meta_eps_dict.keys()) if meta_eps_dict else 0
 
-            total_target = max(max_local_ep, target_child_count, max_meta_ep)
+            # 【防误报防护1】：如果没有任何集信息（无论真实物理文件还是元数据），说明这是空的 Season 占位框，直接跳过
+            if not real_eps_dict and not meta_eps_dict:
+                continue
 
-            if total_target == 0:
+            # 【防误报防护2】：如果本地真实文件集数已经等于或超过了本地最大集号（即无断集），且达到了 TMDB 或元数据的目标集数，判定为完整不缺集
+            total_target = max(max_local_ep, target_child_count, max_meta_ep)
+            if max_local_ep > 0 and len(real_eps_dict) >= max_local_ep and max_local_ep >= total_target:
                 continue
 
             missing_ep_numbers = []
