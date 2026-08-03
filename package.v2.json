@@ -18,12 +18,12 @@
     "name": "Emby剧集缺集检查",
     "description": "精准扫描并找出Emby库中电视剧缺失的集/断集情况，支持界面化数据看板展示。",
     "labels": "媒体库,工具",
-    "version": "3.5.0",
+    "version": "3.6.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/emby.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
-      "v3.5.0": "新增"
+      "v3.6.0": "新增"
     }
   }
 }
