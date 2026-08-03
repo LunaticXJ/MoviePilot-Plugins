@@ -19,17 +19,17 @@ from app.utils.http import RequestUtils
 
 class EmbyMissingEpisodes(_PluginBase):
     """
-    Emby 剧集缺集检查插件：极简聚合版，彻底解决误报、表格渲染与 CSV 免鉴权导出问题
+    Emby 剧集缺集检查插件：支持长篇连载漫（海贼王/火影忍者等）精准差集比对，防跨季全集误报
     """
 
     # 插件名称
     plugin_name = "Emby剧集缺集检查"
     # 插件描述
     plugin_desc = "精准查找 Emby 库中剧集的缺失集情况，聚合显示并支持导出 CSV。"
-    # 插件图标 (已设为空)
+    # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "3.5.0"
+    plugin_version = "3.6.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -66,7 +66,6 @@ class EmbyMissingEpisodes(_PluginBase):
         self.stop_service()
         self.mediaserver_helper = MediaServerHelper()
 
-        # 显式读取历史保存的数据
         self._load_saved_data()
 
         if config:
@@ -94,7 +93,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _load_saved_data(self):
         """
-        从存储读取历史数据
+        读取本地持久化数据
         """
         try:
             saved_data = self.get_data(self._STORAGE_DATA_KEY)
@@ -129,7 +128,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
-        极简配置页面：只保留单选服务器与立即运行一次
+        极简配置页面
         """
         return [
             {
@@ -215,7 +214,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _generate_csv_data_url(self, table_items: List[Dict[str, Any]]) -> str:
         """
-        纯前端 Data URI 生成：免除 API Key 鉴权失败问题
+        纯前端 Data URI 生成
         """
         csv_lines = ["\ufeff剧集名称,缺失季度,缺失集号"]
         for row in table_items:
@@ -230,7 +229,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def get_page(self) -> List[dict]:
         """
-        拼装插件数据主页面：同时注入 key 与 value 字段确保 Vue 3 渲染无误
+        拼装插件数据主页面
         """
         self._load_saved_data()
 
@@ -388,7 +387,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _scan_server_by_diff(self, server_name: str, emby_server) -> List[Dict[str, Any]]:
         """
-        精准差集算法：多重防御彻底杜绝误报
+        精准差集算法：支持长篇动画防跨季全集误报
         """
         host = emby_server.config.config.get("host")
         api_key = emby_server.config.config.get("apikey")
@@ -413,10 +412,11 @@ class EmbyMissingEpisodes(_PluginBase):
 
         raw_seasons = res_seasons.json().get("Items") or []
 
-        # 2. 获取 Episode 列表
+        # 2. 获取 Episode 列表 (不限制数量，全量拉取)
         episodes_url = (
             f"{host}/emby/Users/{user_id}/Items?"
             f"Recursive=true&IncludeItemTypes=Episode"
+            f"&Limit=10000"  # 👈 核心修改：突破 Emby API 100 条的默认 Limit，保证长篇连载漫全集读入
             f"&Fields=IndexNumber,ParentIndexNumber,LocationType,ParentId,PremiereDate"
             f"&api_key={api_key}"
         )
@@ -446,7 +446,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
         missing_results = []
 
-        # 4. 遍历 Seasons 聚合缺集
+        # 4. 遍历 Seasons 精准比对
         for season_item in raw_seasons:
             season_id = season_item.get("Id")
             series_name = season_item.get("SeriesName") or "未知剧集"
@@ -460,16 +460,20 @@ class EmbyMissingEpisodes(_PluginBase):
             real_eps_dict = season_real_eps.get(season_id, {})
             meta_eps_dict = season_all_meta_eps.get(season_id, {})
 
-            max_local_ep = max(real_eps_dict.keys()) if real_eps_dict else 0
-            max_meta_ep = max(meta_eps_dict.keys()) if meta_eps_dict else 0
-
-            # 【防误报防护1】：如果没有任何集信息（无论真实物理文件还是元数据），说明这是空的 Season 占位框，直接跳过
-            if not real_eps_dict and not meta_eps_dict:
+            # 🚨【长篇动漫防误报核心逻辑】：
+            # 如果本地在该 Season 内连【一个】真实文件都没有（`real_eps_dict` 为空），
+            # 说明该剧集在本地是绝对集数存储或未建立 Season 映射，直接 100% 跳过，绝对不强行抛出 1000+ 集缺失！
+            if not real_eps_dict:
                 continue
 
-            # 【防误报防护2】：如果本地真实文件集数已经等于或超过了本地最大集号（即无断集），且达到了 TMDB 或元数据的目标集数，判定为完整不缺集
+            max_local_ep = max(real_eps_dict.keys())
+            max_meta_ep = max(meta_eps_dict.keys()) if meta_eps_dict else 0
+
+            # 确定比对的上限集数
             total_target = max(max_local_ep, target_child_count, max_meta_ep)
-            if max_local_ep > 0 and len(real_eps_dict) >= max_local_ep and max_local_ep >= total_target:
+
+            # 如果本地真实文件集数已经等于或超过上限，说明不缺集，直接跳过
+            if len(real_eps_dict) >= total_target:
                 continue
 
             missing_ep_numbers = []
