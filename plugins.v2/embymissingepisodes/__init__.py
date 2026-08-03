@@ -19,7 +19,7 @@ from app.utils.http import RequestUtils
 
 class EmbyMissingEpisodes(_PluginBase):
     """
-    Emby 剧集缺集检查插件：支持长篇连载漫（海贼王/火影忍者等）精准差集比对，防跨季全集误报
+    Emby 剧集缺集检查插件：极简版，基于 SeriesId 维度精准比对，彻底解决海贼王/火影忍者等长篇漫误报
     """
 
     # 插件名称
@@ -29,7 +29,7 @@ class EmbyMissingEpisodes(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "3.6.0"
+    plugin_version = "4.0.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -387,7 +387,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
     def _scan_server_by_diff(self, server_name: str, emby_server) -> List[Dict[str, Any]]:
         """
-        精准差集算法：支持长篇动画防跨季全集误报
+        基于 SeriesId 维度的绝对聚合差集算法：完美解决长篇连载动画误报
         """
         host = emby_server.config.config.get("host")
         api_key = emby_server.config.config.get("apikey")
@@ -398,7 +398,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
         today_date_str = datetime.now().strftime("%Y-%m-%d")
 
-        # 1. 获取 Season 列表
+        # 1. 批量拉取 Season 列表
         seasons_url = (
             f"{host}/emby/Users/{user_id}/Items?"
             f"Recursive=true&IncludeItemTypes=Season"
@@ -412,12 +412,12 @@ class EmbyMissingEpisodes(_PluginBase):
 
         raw_seasons = res_seasons.json().get("Items") or []
 
-        # 2. 获取 Episode 列表 (不限制数量，全量拉取)
+        # 2. 全量拉取 Episode 列表（包含 SeriesId 与 ParentIndexNumber 季号）
         episodes_url = (
             f"{host}/emby/Users/{user_id}/Items?"
             f"Recursive=true&IncludeItemTypes=Episode"
-            f"&Limit=10000"  # 👈 核心修改：突破 Emby API 100 条的默认 Limit，保证长篇连载漫全集读入
-            f"&Fields=IndexNumber,ParentIndexNumber,LocationType,ParentId,PremiereDate"
+            f"&Limit=20000"
+            f"&Fields=SeriesId,IndexNumber,ParentIndexNumber,LocationType,PremiereDate"
             f"&api_key={api_key}"
         )
         res_episodes = RequestUtils().get_res(episodes_url)
@@ -427,28 +427,31 @@ class EmbyMissingEpisodes(_PluginBase):
 
         raw_episodes = res_episodes.json().get("Items") or []
 
-        # 3. 内存字典索引
-        season_real_eps = defaultdict(dict)
-        season_all_meta_eps = defaultdict(dict)
+        # 3. 构造以 (SeriesId, SeasonNum) 为核心 Key 的本地与元数据双层映射
+        series_season_real_eps = defaultdict(dict)
+        series_season_meta_eps = defaultdict(dict)
 
         for ep in raw_episodes:
-            season_id = ep.get("ParentId")
+            series_id = ep.get("SeriesId")
+            # 如果没有显式 ParentIndexNumber，默认归为 Season 1
+            season_num = int(ep.get("ParentIndexNumber") if ep.get("ParentIndexNumber") is not None else 1)
             ep_num = ep.get("IndexNumber")
             premiere_date = ep.get("PremiereDate", "")
 
-            if not season_id or ep_num is None:
+            if not series_id or ep_num is None:
                 continue
 
-            season_all_meta_eps[season_id][ep_num] = premiere_date
+            composite_key = (series_id, season_num)
+            series_season_meta_eps[composite_key][ep_num] = premiere_date
 
             if ep.get("LocationType") != "Virtual":
-                season_real_eps[season_id][ep_num] = premiere_date
+                series_season_real_eps[composite_key][ep_num] = premiere_date
 
         missing_results = []
 
         # 4. 遍历 Seasons 精准比对
         for season_item in raw_seasons:
-            season_id = season_item.get("Id")
+            series_id = season_item.get("SeriesId")
             series_name = season_item.get("SeriesName") or "未知剧集"
             season_num = int(season_item.get("IndexNumber") if season_item.get("IndexNumber") is not None else 1)
             target_child_count = int(season_item.get("ChildCount") if season_item.get("ChildCount") is not None else 0)
@@ -457,27 +460,28 @@ class EmbyMissingEpisodes(_PluginBase):
             if self._ignore_season_zero and season_num == 0:
                 continue
 
-            real_eps_dict = season_real_eps.get(season_id, {})
-            meta_eps_dict = season_all_meta_eps.get(season_id, {})
+            composite_key = (series_id, season_num)
+            real_eps_dict = series_season_real_eps.get(composite_key, {})
+            meta_eps_dict = series_season_meta_eps.get(composite_key, {})
 
-            # 🚨【长篇动漫防误报核心逻辑】：
-            # 如果本地在该 Season 内连【一个】真实文件都没有（`real_eps_dict` 为空），
-            # 说明该剧集在本地是绝对集数存储或未建立 Season 映射，直接 100% 跳过，绝对不强行抛出 1000+ 集缺失！
+            # 🚨【核心防御 1】：如果当前 Season 在本地无任何物理文件，直接 100% 跳过！
+            # 绝对不凭空拉取 TMDB 的标称总集数（1000+）来强行判定整季缺失
             if not real_eps_dict:
                 continue
 
             max_local_ep = max(real_eps_dict.keys())
             max_meta_ep = max(meta_eps_dict.keys()) if meta_eps_dict else 0
 
-            # 确定比对的上限集数
+            # 计算合理的目标比对集数上限
             total_target = max(max_local_ep, target_child_count, max_meta_ep)
 
-            # 如果本地真实文件集数已经等于或超过上限，说明不缺集，直接跳过
-            if len(real_eps_dict) >= total_target:
+            # 🚨【核心防御 2】：如果本地真实文件数已经覆盖到了最大集号且达到了目标集数，说明完结且无断集
+            if len(real_eps_dict) >= total_target and max_local_ep >= total_target:
                 continue
 
             missing_ep_numbers = []
 
+            # 在 1 到 total_target 范围内精准查找空缺
             for i in range(1, total_target + 1):
                 if i not in real_eps_dict:
                     ep_premiere_date = meta_eps_dict.get(i, "")
