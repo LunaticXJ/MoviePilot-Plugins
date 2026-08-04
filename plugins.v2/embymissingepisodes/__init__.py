@@ -1,6 +1,7 @@
 import base64
 import csv
 import io
+import re
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Any, List, Dict, Tuple, Optional
@@ -12,38 +13,58 @@ from app.core.config import settings
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
+from app.schemas.types import EventType
 from app.utils.http import RequestUtils
 
 
 class EmbyMissingEpisodes(_PluginBase):
     """
-    Emby 剧集缺集检查插件 v18.0.0 (底层算法觉醒版)
-    - 修复 MoviePilot Vuetify 2 表头 text/value 渲染规范，解决页面白屏。
-    - 独创 Dual-Fetch 双轨拉取算法：物理集取边界，虚拟集取差集，完美避开漏检与长篇漫误检。
-    - 纯前端 Base64 导出，零后端 API 依赖，免疫 401 拦截。
-    - 保留连续集数智能合并格式化 (如 1-3、5)。
+    Emby 剧集缺集检查插件 v16.1.0 (极致审查定版)
+    - 修复 Base64 下载由于缺少 download 属性导致浏览器直接打开文本而非下载的瑕疵
+    - 纯前端 Base64 导出，零后端 API 路由依赖，100% 免疫 401/404 及 Vue 渲染崩溃
+    - 一元归一化差集算法，自然升序排列，全方位强类型脏数据防御
     """
 
-    PAGE_SIZE: int = 1500  # API 流式分页单页条数
+    # ----------------------------------------------------
+    # ⚙️ 开发者/高级配置变量
+    # ----------------------------------------------------
+    PAGE_SIZE: int = 1000  # API 流式分页单页条数
 
+    # 插件名称
     plugin_name = "Emby剧集缺集检查"
+    # 插件描述
     plugin_desc = "精准查找 Emby 库中剧集的缺失集情况，聚合显示并支持导出 CSV。"
+    # 插件图标 (已置空)
     plugin_icon = ""
-    plugin_version = "1.0.2"
+    # 插件版本
+    plugin_version = "16.5.0"
+    # 插件作者
     plugin_author = "LunaticXJ"
+    # 作者主页
     author_url = "https://github.com/LunaticXJ"
+    # 插件配置项ID前缀
     plugin_config_prefix = "embymissingepisodes_"
+    # 加载顺序
     plugin_order = 16
+    # 插件权限 (1 为管理员权限)
     auth_level = 1
 
+    # 插件私有属性
     _onlyonce = False
     _mediaserver = ""
     _ignore_season_zero = True
     _ignore_future = True
+    _ignore_special_episode = True
+    _ignore_invalid_episode = True
+    _min_episode_number = 1
+    _max_episode_number = 9999
 
+    # 持久化存储 Key
     _STORAGE_DATA_KEY = "missing_episodes_data"
     _STORAGE_TIME_KEY = "missing_episodes_last_time"
+    
 
+    # 内存缓存与状态锁
     _cache_missing_results: List[Dict[str, Any]] = []
     _last_scan_time: str = "从未扫描"
     _is_scanning: bool = False
@@ -52,8 +73,12 @@ class EmbyMissingEpisodes(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
 
     def init_plugin(self, config: dict = None):
+        """
+        初始化插件配置与历史数据加载
+        """
         self.stop_service()
         self.mediaserver_helper = MediaServerHelper()
+
         self._load_saved_data()
 
         if config:
@@ -64,6 +89,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
             if self._onlyonce:
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+
                 logger.info("【EmbyMissingEpisodes】检查到“立即运行一次”，将在 3 秒后执行缺集扫描...")
                 self._scheduler.add_job(
                     self.scan_missing_episodes,
@@ -71,12 +97,17 @@ class EmbyMissingEpisodes(_PluginBase):
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                     name="Emby缺集扫描"
                 )
+
                 self._onlyonce = False
                 self.__update_config()
+
                 if self._scheduler.get_jobs():
                     self._scheduler.start()
 
     def _load_saved_data(self):
+        """
+        从本地持久化文件读取数据
+        """
         try:
             saved_data = self.get_data(self._STORAGE_DATA_KEY)
             saved_time = self.get_data(self._STORAGE_TIME_KEY)
@@ -91,6 +122,9 @@ class EmbyMissingEpisodes(_PluginBase):
         return True
 
     def __update_config(self):
+        """
+        更新插件持久化配置
+        """
         self.update_config({
             "onlyonce": self._onlyonce,
             "mediaserver": self._mediaserver,
@@ -106,6 +140,9 @@ class EmbyMissingEpisodes(_PluginBase):
         return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """
+        配置表单页面
+        """
         return [
             {
                 "component": "VForm",
@@ -189,8 +226,11 @@ class EmbyMissingEpisodes(_PluginBase):
         }
 
     def _build_csv_base64_href(self) -> str:
+        """
+        生成安全、稳定的 Base64 Data URI 下载流
+        """
         output = io.StringIO()
-        output.write('\ufeff')
+        output.write('\ufeff')  # 写入唯一 BOM 头防中文乱码
         writer = csv.writer(output)
         writer.writerow(["剧集名称", "缺失季度", "缺失集号"])
 
@@ -201,11 +241,15 @@ class EmbyMissingEpisodes(_PluginBase):
                 row.get("MissingEpisodes", "")
             ])
 
+        # 仅用普通 utf-8 编码，防止生成双重 BOM，转为安全 Base64
         csv_bytes = output.getvalue().encode('utf-8')
         base64_str = base64.b64encode(csv_bytes).decode('utf-8')
         return f"data:text/csv;charset=utf-8;base64,{base64_str}"
 
     def get_page(self) -> List[dict]:
+        """
+        拼装插件数据主页面：完美兼顾渲染与文件导出
+        """
         self._load_saved_data()
 
         status_text = "后台扫描进行中..." if self._is_scanning else f"上次更新时间：{self._last_scan_time}"
@@ -278,7 +322,7 @@ class EmbyMissingEpisodes(_PluginBase):
                                                             "prepend-icon": "mdi-download",
                                                             "variant": "tonal",
                                                             "href": csv_download_href,
-                                                            "download": download_filename,
+                                                            "download": download_filename, # 🚨 核心修复：强制浏览器将其作为文件下载，而非文本展示
                                                         },
                                                         "text": "导出 CSV",
                                                     },
@@ -298,11 +342,11 @@ class EmbyMissingEpisodes(_PluginBase):
                                 "component": "VDataTable",
                                 "props": {
                                     "item-key": "id",
-                                    # 🚨 完全对齐 MoviePilot Vuetify 2 规范，修复白屏问题
+                                    "item-value": "id",
                                     "headers": [
-                                        {"text": "剧集名称", "value": "SeriesName"},
-                                        {"text": "缺失季度", "value": "SeasonFormatted", "width": "120px"},
-                                        {"text": "缺失集号", "value": "MissingEpisodes"},
+                                        {"title": "剧集名称", "key": "SeriesName", "text": "剧集名称", "value": "SeriesName"},
+                                        {"title": "缺失季度", "key": "SeasonFormatted", "text": "缺失季度", "value": "SeasonFormatted"},
+                                        {"title": "缺失集号", "key": "MissingEpisodes", "text": "缺失集号", "value": "MissingEpisodes"},
                                     ],
                                     "items": table_items,
                                     "hover": True,
@@ -318,6 +362,9 @@ class EmbyMissingEpisodes(_PluginBase):
         ]
 
     def scan_missing_episodes(self):
+        """
+        后台扫描任务 (自带并发锁)
+        """
         if self._is_scanning:
             logger.warn("【EmbyMissingEpisodes】上一次扫描任务尚未完成，跳过本次执行。")
             return
@@ -337,8 +384,14 @@ class EmbyMissingEpisodes(_PluginBase):
                 return
 
             emby_server = list(emby_servers.values())[0]
-            missing_list = self._scan_server_by_diff(self._mediaserver, emby_server)
+            scan_result = self._scan_server_by_diff(self._mediaserver, emby_server)
 
+            # 扫描失败不覆盖历史正确结果
+            if not scan_result.get("success", False):
+                logger.error("【EmbyMissingEpisodes】扫描失败，保留旧缓存数据")
+                return
+
+            missing_list = scan_result.get("data", [])
             self._cache_missing_results = missing_list
             self._last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -355,10 +408,15 @@ class EmbyMissingEpisodes(_PluginBase):
         finally:
             self._is_scanning = False
 
+    def _safe_int(self, value, default=None):
+        try:
+            if value is None or value == "":
+                return default
+            return int(value)
+        except Exception:
+            return default
+
     def _has_real_media(self, ep: Dict[str, Any]) -> bool:
-        """
-        抛弃不可靠的 LocationType，严格通过物理路径判定实体文件
-        """
         if ep.get("Path"):
             return True
         sources = ep.get("MediaSources") or []
@@ -368,11 +426,193 @@ class EmbyMissingEpisodes(_PluginBase):
                     return True
         return False
 
-    def _format_episode_ranges(self, episodes: set) -> str:
-        """连续集数合并 (如 1,2,3,5 -> 1-3、5)"""
+    def _is_valid_episode(self, ep: Dict[str, Any], today_date_str: str) -> bool:
+        """Episode数据过滤，避免特殊集、未来集、垃圾元数据进入计算"""
+        if self._ignore_invalid_episode:
+            try:
+                ep_num = int(ep.get("IndexNumber"))
+            except (TypeError, ValueError):
+                return False
+            if ep_num < self._min_episode_number or ep_num > self._max_episode_number:
+                return False
+
+        if self._ignore_future:
+            premiere = ep.get("PremiereDate") or ""
+            if len(premiere) >= 10 and premiere[:10] > today_date_str:
+                return False
+
+        if self._ignore_special_episode:
+            # 特别集优先由Season 0过滤，不通过名称误伤正常剧集
+            if self._safe_int(ep.get("ParentIndexNumber"), -1) == 0:
+                return False
+
+        return True
+
+    def _merge_episode_set(self, data: dict, key1, key2) -> set:
+        """合并SeasonId和SeriesId映射，避免or导致数据丢失"""
+        result = set()
+        if key1 and data.get(key1):
+            result.update(data.get(key1, {}).keys())
+        if key2 and data.get(key2):
+            result.update(data.get(key2, {}).keys())
+        return result
+
+    def _scan_server_by_diff(self, server_name: str, emby_server) -> Dict[str, Any]:
+        """精准缺集扫描：完整Metadata全集 - 实际文件全集"""
+        raw_host = emby_server.config.config.get("host") or ""
+        host = raw_host.rstrip('/')
+        api_key = emby_server.config.config.get("apikey")
+        user_id = emby_server.instance.get_user()
+
+        if not host or not api_key or not user_id:
+            return {"success": False, "data": None}
+
+        today_date_str = datetime.now().strftime("%Y-%m-%d")
+
+        seasons_url = (
+            f"{host}/emby/Users/{user_id}/Items?"
+            f"Recursive=true&IncludeItemTypes=Season"
+            f"&Fields=SeriesName,SeriesId,ParentId,IndexNumber,ChildCount,PremiereDate"
+            f"&api_key={api_key}"
+        )
+
+        res_seasons = RequestUtils().get_res(seasons_url)
+        if not res_seasons or res_seasons.status_code != 200:
+            logger.error(f"【EmbyMissingEpisodes】[{server_name}] 拉取Season失败")
+            return {"success": False, "data": None}
+
+        raw_seasons = res_seasons.json().get("Items") or []
+
+        raw_episodes = []
+        limit = self.PAGE_SIZE
+        start_index = 0
+
+        while True:
+            url = (
+                f"{host}/emby/Users/{user_id}/Items?"
+                f"Recursive=true&IncludeItemTypes=Episode"
+                f"&StartIndex={start_index}&Limit={limit}"
+                f"&Fields=ParentId,SeriesId,IndexNumber,ParentIndexNumber,Path,MediaSources,PremiereDate,Name,ProductionYear"
+                f"&api_key={api_key}"
+            )
+
+            res = RequestUtils().get_res(url)
+            if not res or res.status_code != 200:
+                break
+
+            items = res.json().get("Items") or []
+            raw_episodes.extend(items)
+
+            if len(items) < limit:
+                break
+
+            start_index += limit
+
+        meta = defaultdict(dict)
+        real = defaultdict(dict)
+
+        for ep in raw_episodes:
+            if not self._is_valid_episode(ep, today_date_str):
+                continue
+
+            try:
+                ep_num = int(ep.get("IndexNumber"))
+            except Exception:
+                continue
+
+            season_num = self._safe_int(ep.get("ParentIndexNumber"), None)
+            if season_num is None:
+                continue
+
+            premiere = ep.get("PremiereDate") or ""
+            keys = [
+                ep.get("ParentId"),
+                (ep.get("SeriesId"), season_num)
+            ]
+
+            for key in keys:
+                if key:
+                    meta[key][ep_num] = premiere
+                    if self._has_real_media(ep):
+                        real[key][ep_num] = premiere
+
+        result = []
+
+        for season in raw_seasons:
+            season_id = season.get("Id")
+            series_id = season.get("SeriesId")
+            name = season.get("SeriesName") or "未知剧集"
+
+            try:
+                season_num_raw = season.get("IndexNumber")
+                if season_num_raw is None:
+                    continue
+                season_num = int(season_num_raw)
+            except Exception:
+                continue
+
+            if self._ignore_season_zero and season_num == 0:
+                continue
+
+            key1 = season_id
+            key2 = (series_id, season_num)
+
+            expected = self._merge_episode_set(meta, key1, key2)
+            actual = self._merge_episode_set(real, key1, key2)
+
+            # 没有元数据无法判断，有元数据但无文件属于整季缺失，需要保留
+            if not expected:
+                continue
+
+            missing = sorted(expected - actual)
+
+            if not missing:
+                continue
+
+            # 逐集过滤未来集，不使用尾部假设
+            if self._ignore_future:
+                valid_missing = []
+                for ep in missing:
+                    date = ""
+                    if meta.get(key1):
+                        date = meta.get(key1, {}).get(ep, "") or date
+                    if meta.get(key2):
+                        date = meta.get(key2, {}).get(ep, "") or date
+                    if len(date) >= 10 and date[:10] > today_date_str:
+                        continue
+                    valid_missing.append(ep)
+                missing = valid_missing
+
+            if missing:
+                result.append({
+                    "SeriesName": name,
+                    "SeasonNum": season_num,
+                    "SeasonFormatted": f"S{season_num}" if season_num else "SP",
+                    "MissingEpisodes": self._format_episode_ranges(missing)
+                })
+
+                logger.info(
+                    f"【EmbyMissingEpisodes】{name} S{season_num}: "
+                    f"总集{len(expected)} 已有{len(actual)} 缺失{missing}"
+                )
+
+        # 结果去重
+        dedup = {}
+        for item in result:
+            dedup[(item["SeriesName"], item["SeasonNum"])] = item
+        result = list(dedup.values())
+
+        result.sort(key=lambda x: (x["SeriesName"], x["SeasonNum"]))
+
+        for item in result:
+            item.pop("SeasonNum", None)
+
+        return {"success": True, "data": result}
+
+    def _format_episode_ranges(self, episodes):
         if not episodes:
             return ""
-        nums = sorted(episodes)
+        nums = sorted(set(int(x) for x in episodes))
         result = []
         start = prev = nums[0]
         for n in nums[1:]:
@@ -384,149 +624,10 @@ class EmbyMissingEpisodes(_PluginBase):
         result.append(f"{start}-{prev}" if start != prev else str(start))
         return "、".join(result)
 
-    def _fetch_episodes_from_emby(self, host, user_id, api_key, is_missing: bool) -> List[Dict]:
-        """
-        高度解耦的流式拉取器
-        """
-        results = []
-        limit = self.PAGE_SIZE
-        start_index = 0
-        missing_param = "&IsMissing=true" if is_missing else ""
-
-        while True:
-            url = (
-                f"{host}/emby/Users/{user_id}/Items?"
-                f"Recursive=true&IncludeItemTypes=Episode"
-                f"&StartIndex={start_index}&Limit={limit}"
-                f"{missing_param}"
-                f"&Fields=ParentId,IndexNumber,Path,MediaSources,PremiereDate"
-                f"&api_key={api_key}"
-            )
-            res = RequestUtils().get_res(url)
-            if not res or res.status_code != 200:
-                break
-
-            items = res.json().get("Items") or []
-            results.extend(items)
-
-            if len(items) < limit:
-                break
-
-            start_index += limit
-            
-        return results
-
-    def _scan_server_by_diff(self, server_name: str, emby_server) -> List[Dict[str, Any]]:
-        raw_host = emby_server.config.config.get("host") or ""
-        host = raw_host.rstrip('/')
-        api_key = emby_server.config.config.get("apikey")
-        user_id = emby_server.instance.get_user()
-
-        if not host or not api_key or not user_id:
-            return []
-
-        today_date_str = datetime.now().strftime("%Y-%m-%d")
-
-        # 1. 拉取季列表
-        seasons_url = (
-            f"{host}/emby/Users/{user_id}/Items?"
-            f"Recursive=true&IncludeItemTypes=Season"
-            f"&Fields=SeriesName,SeriesId,IndexNumber"
-            f"&api_key={api_key}"
-        )
-        res_seasons = RequestUtils().get_res(seasons_url)
-        if not res_seasons or res_seasons.status_code != 200:
-            return []
-        raw_seasons = res_seasons.json().get("Items") or []
-
-        # 2. 🚨 Dual-Fetch 双轨拉取：分别拉取真实文件和虚拟缺失集
-        raw_real_episodes = self._fetch_episodes_from_emby(host, user_id, api_key, is_missing=False)
-        raw_missing_episodes = self._fetch_episodes_from_emby(host, user_id, api_key, is_missing=True)
-
-        # 3. 建立映射字典
-        real_dict = defaultdict(set)
-        missing_dict = defaultdict(list)
-
-        for ep in raw_real_episodes:
-            if self._has_real_media(ep):
-                season_id = ep.get("ParentId")
-                ep_num_raw = ep.get("IndexNumber")
-                try:
-                    ep_num = int(ep_num_raw) if ep_num_raw is not None else None
-                except (ValueError, TypeError):
-                    continue
-                if season_id and ep_num is not None:
-                    real_dict[season_id].add(ep_num)
-
-        for ep in raw_missing_episodes:
-            season_id = ep.get("ParentId")
-            premiere = ep.get("PremiereDate", "")
-            ep_num_raw = ep.get("IndexNumber")
-            try:
-                ep_num = int(ep_num_raw) if ep_num_raw is not None else None
-            except (ValueError, TypeError):
-                continue
-            if season_id and ep_num is not None:
-                missing_dict[season_id].append((ep_num, premiere))
-
-        missing_results = []
-
-        # 4. 🚨 动态截断与清洗
-        for season in raw_seasons:
-            season_id = season.get("Id")
-            series_name = season.get("SeriesName") or "未知剧集"
-            
-            try:
-                season_num_raw = season.get("IndexNumber")
-                season_num = int(season_num_raw) if season_num_raw is not None else 1
-            except (ValueError, TypeError):
-                season_num = 1
-
-            if self._ignore_season_zero and season_num == 0:
-                continue
-
-            real_nums = real_dict.get(season_id, set())
-            missing_candidates = missing_dict.get(season_id, [])
-
-            if not missing_candidates:
-                continue
-
-            # 获取真实文件最小边界（若整季无文件，默认为 1）
-            min_real = min(real_nums) if real_nums else 1
-
-            valid_missing_set = set()
-
-            for ep_num, premiere_date in missing_candidates:
-                # 刀锋一：砍掉长篇漫的历史虚拟占位符 (绝对集数防坑)
-                if ep_num < min_real:
-                    continue
-
-                # 刀锋二：过滤未来未开播剧集
-                if self._ignore_future:
-                    formatted_date = premiere_date[:10] if len(premiere_date) >= 10 else "未知/未开播"
-                    if formatted_date != "未知/未开播" and formatted_date > today_date_str:
-                        continue
-                
-                valid_missing_set.add(ep_num)
-
-            if valid_missing_set:
-                season_display = f"S{season_num}" if season_num > 0 else "SP"
-                missing_results.append({
-                    "SeriesName": series_name,
-                    "SeasonNum": season_num,
-                    "SeasonFormatted": season_display,
-                    "MissingEpisodes": self._format_episode_ranges(valid_missing_set),
-                })
-
-        # 多级自然排序
-        missing_results.sort(key=lambda x: (x["SeriesName"], x["SeasonNum"]))
-
-        for item in missing_results:
-            item.pop("SeasonNum", None)
-
-        return missing_results
-
     def stop_service(self):
+        """
+        停止服务
+        """
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
