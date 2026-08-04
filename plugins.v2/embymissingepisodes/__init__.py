@@ -1,6 +1,8 @@
 import base64
 import csv
 import io
+import time
+import requests
 import concurrent.futures
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -18,17 +20,17 @@ from app.utils.http import RequestUtils
 
 class EmbyMissingEpisodes(_PluginBase):
     """
-    Emby 剧集缺集检查插件 v20.0.0 (TMDB 真理溯源版)
-    - 底层重构：抛弃 Emby 虚假元数据，完全参照 TMDB API 获取标准集数。
-    - 算法降维：通过 TMDB(理论集) - Emby(物理集) = 绝对缺集，彻底消灭长篇漫误报与季播剧漏检。
-    - 性能优化：引入 ThreadPoolExecutor 并发扫描引擎，大幅提升扫描速度。
-    - UI 修复：严守 Vuetify 2 规范，修复白屏问题，保留纯前端 Base64 极速导出。
+    Emby 剧集缺集检查插件 v1.0.0 (Gaps 算法独立插件版)
+    - 修复依赖：摒弃侵入式核心 cfg 调用，回归标准的插件表单输入与 settings 环境。
+    - 智能合集：支持 IndexNumberEnd 字段，完美解析 S01E01-E03 合集文件，杜绝误报。
+    - 内存比对：全局库存单次内存拉取构建，避免 API 洪泛导致 Emby 服务崩溃。
+    - UI 兼容：严格遵守 Vuetify 2 规范，解决渲染白屏，保留原生前端 Base64 导出。
     """
 
     plugin_name = "Emby剧集缺集检查"
-    plugin_desc = "基于 TMDB 数据源，精准比对并查找 Emby 库中的缺失剧集。"
+    plugin_desc = "利用 TMDB 溯源精准比对并查找 Emby 库中的缺失剧集。"
     plugin_icon = ""
-    plugin_version = "20.0.0"
+    plugin_version = "22.0.0"
     plugin_author = "LunaticXJ"
     author_url = "https://github.com/LunaticXJ"
     plugin_config_prefix = "embymissingepisodes_"
@@ -38,7 +40,6 @@ class EmbyMissingEpisodes(_PluginBase):
     _onlyonce = False
     _mediaserver = ""
     _tmdb_api_key = ""
-    _concurrency_workers = 4
     _ignore_season_zero = True
     _ignore_future = True
 
@@ -61,18 +62,17 @@ class EmbyMissingEpisodes(_PluginBase):
             self._onlyonce = config.get("onlyonce", False)
             self._mediaserver = config.get("mediaserver", "")
             self._tmdb_api_key = config.get("tmdb_api_key", "").strip()
-            self._concurrency_workers = int(config.get("concurrency_workers", 4))
             self._ignore_season_zero = config.get("ignore_season_zero", True)
             self._ignore_future = config.get("ignore_future", True)
 
             if self._onlyonce:
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-                logger.info("【EmbyMissingEpisodes】检查到“立即运行一次”，将在 3 秒后执行并发缺集扫描...")
+                logger.info("【EmbyMissingEpisodes】检查到“立即运行一次”，将在 3 秒后执行全局内存并发扫描...")
                 self._scheduler.add_job(
                     self.scan_missing_episodes,
                     'date',
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                    name="EmbyTMDB并发缺集扫描"
+                    name="EmbyTMDB全局内存缺集扫描"
                 )
                 self._onlyonce = False
                 self.__update_config()
@@ -98,7 +98,6 @@ class EmbyMissingEpisodes(_PluginBase):
             "onlyonce": self._onlyonce,
             "mediaserver": self._mediaserver,
             "tmdb_api_key": self._tmdb_api_key,
-            "concurrency_workers": self._concurrency_workers,
             "ignore_season_zero": self._ignore_season_zero,
             "ignore_future": self._ignore_future,
         })
@@ -120,33 +119,15 @@ class EmbyMissingEpisodes(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 12},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "tmdb_api_key",
-                                            "label": "TMDB API Key (必填，用于提供绝对精准的理论集数参考)",
-                                            "placeholder": "请输入 v3 API Key",
+                                            "label": "TMDB API Key (必填，用于拉取最准确的应有集数)",
+                                            "placeholder": "请输入 TMDB v3 API Key",
                                             "clearable": True,
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "concurrency_workers",
-                                            "label": "并发请求线程数",
-                                            "items": [
-                                                {"title": "单线程 (最稳)", "value": 1},
-                                                {"title": "4 线程 (推荐)", "value": 4},
-                                                {"title": "8 线程 (极速)", "value": 8},
-                                            ],
                                         }
                                     }
                                 ]
@@ -164,7 +145,7 @@ class EmbyMissingEpisodes(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "onlyonce",
-                                            "label": "保存并立即运行扫描",
+                                            "label": "保存并立即运行一次",
                                         },
                                     }
                                 ],
@@ -227,7 +208,6 @@ class EmbyMissingEpisodes(_PluginBase):
         ], {
             "onlyonce": False,
             "tmdb_api_key": "",
-            "concurrency_workers": 4,
             "ignore_season_zero": True,
             "ignore_future": True,
             "mediaserver": "",
@@ -253,7 +233,7 @@ class EmbyMissingEpisodes(_PluginBase):
     def get_page(self) -> List[dict]:
         self._load_saved_data()
         csv_download_href = self._build_csv_base64_href()
-        status_text = f"正在进行 TMDB 并发比对扫描中..." if self._is_scanning else f"上次扫描: {self._last_scan_time}"
+        status_text = f"后台扫描中..." if self._is_scanning else f"上次扫描: {self._last_scan_time}"
 
         return [
             {
@@ -268,7 +248,7 @@ class EmbyMissingEpisodes(_PluginBase):
                                 "props": {
                                     "color": "success",
                                     "href": csv_download_href,
-                                    "download": f"EmbyTMDB缺集比对_{datetime.now().strftime('%Y%m%d%H%M')}.csv",
+                                    "download": f"EmbyTMDB缺集清单_{datetime.now().strftime('%Y%m%d%H%M')}.csv",
                                     "variant": "tonal",
                                     "prepend-icon": "mdi-download",
                                 },
@@ -292,64 +272,21 @@ class EmbyMissingEpisodes(_PluginBase):
                         "hover": True,
                         "density": "comfortable",
                         "items-per-page": 15,
-                        "no-data-text": "暂无数据。请确保已填入 TMDB API Key 并执行了扫描。"
+                        "no-data-text": "暂无数据。请确保配置了 TMDB API Key 并执行了扫描。"
                     }
                 }]
             }
         ]
 
-    def scan_missing_episodes(self):
-        if self._is_scanning:
-            logger.warn("【EmbyMissingEpisodes】上次并发扫描尚未结束，跳过本次触发。")
-            return
-
-        if not self._tmdb_api_key:
-            logger.error("【EmbyMissingEpisodes】未配置 TMDB API Key，无法执行溯源比对扫描！")
-            return
-
-        self._is_scanning = True
-        start_time = datetime.now()
-        logger.info(f"【EmbyMissingEpisodes】启动 TMDB 并发扫描引擎 (线程数: {self._concurrency_workers})...")
-
-        try:
-            if not self._mediaserver:
-                logger.error("【EmbyMissingEpisodes】未选择 Emby 媒体服务器！")
-                return
-
-            emby_servers = self.mediaserver_helper.get_services(name_filters=[self._mediaserver], type_filter="emby")
-            if not emby_servers:
-                logger.error(f"【EmbyMissingEpisodes】未找到对应的 Emby 服务器。")
-                return
-
-            emby_server = list(emby_servers.values())[0]
-            missing_list = self._execute_concurrent_scan(emby_server)
-
-            self._cache_missing_results = missing_list
-            self._last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            self.save_data(self._STORAGE_DATA_KEY, self._cache_missing_results)
-            self.save_data(self._STORAGE_TIME_KEY, self._last_scan_time)
-
-            elapsed = (datetime.now() - start_time).total_seconds()
-            logger.info(f"【EmbyMissingEpisodes】>>> 扫描圆满结束！耗时 {elapsed:.1f} 秒，检出 {len(missing_list)} 季存在缺集。")
-        except Exception as e:
-            logger.error(f"【EmbyMissingEpisodes】并发扫描崩溃: {e}", exc_info=True)
-        finally:
-            self._is_scanning = False
-
-    def _has_real_media(self, ep: Dict[str, Any]) -> bool:
-        """只认证物理存在的真理标准"""
-        if ep.get("Path"):
-            return True
-        sources = ep.get("MediaSources") or []
-        if isinstance(sources, list):
-            for source in sources:
-                if isinstance(source, dict) and source.get("Path"):
-                    return True
-        return False
+    def _get_proxies(self):
+        """安全读取 MoviePilot 系统代理设置，避免断网"""
+        proxy = getattr(settings, "PROXY", None)
+        if proxy:
+            return {"http": proxy, "https": proxy}
+        return None
 
     def _format_episode_ranges(self, episodes: set) -> str:
-        """格式化连续集数 (如 1,2,3,5 -> 1-3、5)"""
+        """智能合并连续集数 (如 1,2,3,5 -> 1-3、5)"""
         if not episodes:
             return ""
         nums = sorted(episodes)
@@ -364,145 +301,178 @@ class EmbyMissingEpisodes(_PluginBase):
         result.append(f"{start}-{prev}" if start != prev else str(start))
         return "、".join(result)
 
-    def _process_single_series(self, series_item: dict, host: str, api_key: str, user_id: str, today_str: str) -> List[Dict[str, Any]]:
-        """
-        工作线程：单个剧集的完整 TMDB 校验与 Emby 实体查漏闭环
-        """
-        series_id = series_item.get("Id")
-        series_name = series_item.get("Name", "未知剧集")
-        provider_ids = series_item.get("ProviderIds") or {}
+    def _process_single_series(self, series: dict, global_inventory: dict, tmdb_key: str, proxies: dict, today: str) -> List[Dict]:
+        """独立线程处理单个剧集，基于内存查漏补缺"""
+        series_id = series.get("Id")
+        series_name = series.get("Name", "未知剧集")
+        tmdb_id = series.get("ProviderIds", {}).get("Tmdb")
         
-        tmdb_id_str = provider_ids.get("Tmdb") or provider_ids.get("TMDB") or provider_ids.get("tmdb")
-        if not tmdb_id_str:
+        if not tmdb_id:
             return []
 
-        # 1. 问责 TMDB：这部剧理论上该有多少季？
-        tmdb_series_url = f"https://api.themoviedb.org/3/tv/{tmdb_id_str}?api_key={self._tmdb_api_key}&language=zh-CN"
-        res_tmdb = RequestUtils().get_res(tmdb_series_url)
-        if not res_tmdb or res_tmdb.status_code != 200:
+        local_inventory = global_inventory.get(series_id, {})
+        
+        try:
+            tmdb_series_data = requests.get(
+                f"https://api.themoviedb.org/3/tv/{tmdb_id}?language=zh-CN&api_key={tmdb_key}", 
+                proxies=proxies, 
+                timeout=10
+            ).json()
+            tmdb_seasons = tmdb_series_data.get("seasons", [])
+        except Exception:
             return []
-            
-        tmdb_seasons = res_tmdb.json().get("seasons", [])
-        expected_map = defaultdict(set)
 
-        # 2. 问责 TMDB 详情：每一季每一集是否开播？
+        series_gaps = []
+        
         for season in tmdb_seasons:
             s_num = season.get("season_number")
-            if s_num is None or (s_num == 0 and self._ignore_season_zero):
+            if s_num is None or season.get("episode_count", 0) == 0: 
+                continue
+            
+            if self._ignore_season_zero and s_num == 0:
                 continue
                 
-            season_url = f"https://api.themoviedb.org/3/tv/{tmdb_id_str}/season/{s_num}?api_key={self._tmdb_api_key}&language=zh-CN"
-            res_season = RequestUtils().get_res(season_url)
-            if not res_season or res_season.status_code != 200:
+            local_season_inventory = local_inventory.get(s_num, set())
+            
+            if len(local_season_inventory) >= season.get("episode_count", 0):
+                continue
+
+            try:
+                tmdb_episodes = requests.get(
+                    f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{s_num}?language=zh-CN&api_key={tmdb_key}", 
+                    proxies=proxies, 
+                    timeout=10
+                ).json().get("episodes", [])
+            except Exception:
                 continue
                 
-            episodes = res_season.json().get("episodes", [])
-            for ep in episodes:
-                ep_num = ep.get("episode_number")
-                if ep_num is None:
+            missing_eps = set()
+            for tmdb_ep in tmdb_episodes:
+                e_num = tmdb_ep.get("episode_number")
+                air_date = tmdb_ep.get("air_date")
+                
+                if self._ignore_future and (not air_date or air_date >= today):
                     continue
                     
-                if self._ignore_future:
-                    air_date = ep.get("air_date") or ""
-                    if not air_date or air_date > today_str:
-                        continue
-                        
-                expected_map[s_num].add(ep_num)
-
-        if not expected_map:
-            return []
-
-        # 3. 问责 Emby 物理硬盘：这部剧到底存了什么物理文件？
-        emby_eps_url = (
-            f"{host}/emby/Users/{user_id}/Items?"
-            f"ParentId={series_id}&Recursive=true&IncludeItemTypes=Episode"
-            f"&Fields=ParentIndexNumber,IndexNumber,Path,MediaSources"
-            f"&api_key={api_key}"
-        )
-        res_emby = RequestUtils().get_res(emby_eps_url)
-        existing_map = defaultdict(set)
-        
-        if res_emby and res_emby.status_code == 200:
-            emby_eps = res_emby.json().get("Items", [])
-            for ep in emby_eps:
-                if self._has_real_media(ep):
-                    s_num_raw = ep.get("ParentIndexNumber")
-                    ep_num_raw = ep.get("IndexNumber")
-                    try:
-                        s_num = int(s_num_raw) if s_num_raw is not None else 1
-                        ep_num = int(ep_num_raw) if ep_num_raw is not None else None
-                    except (ValueError, TypeError):
-                        continue
-                    if ep_num is not None:
-                        existing_map[s_num].add(ep_num)
-
-        # 4. 纯粹的绝对减法 (Expected - Existing)
-        results = []
-        for s_num in sorted(expected_map.keys()):
-            expected_eps = expected_map[s_num]
-            existing_eps = existing_map.get(s_num, set())
-            
-            missing_eps = expected_eps - existing_eps
-            
+                if e_num not in local_season_inventory:
+                    missing_eps.add(e_num)
+                    
             if missing_eps:
-                results.append({
+                series_gaps.append({
                     "SeriesName": series_name,
                     "SeasonNum": s_num,
                     "SeasonFormatted": f"S{s_num}" if s_num > 0 else "SP",
-                    "MissingEpisodes": self._format_episode_ranges(missing_eps),
+                    "MissingEpisodes": self._format_episode_ranges(missing_eps)
                 })
                 
-        return results
+        return series_gaps
 
-    def _execute_concurrent_scan(self, emby_server) -> List[Dict[str, Any]]:
-        """并发任务调度中心"""
-        raw_host = emby_server.config.config.get("host") or ""
-        host = raw_host.rstrip('/')
-        api_key = emby_server.config.config.get("apikey")
-        user_id = emby_server.instance.get_user()
+    def scan_missing_episodes(self):
+        if self._is_scanning:
+            logger.warn("【EmbyMissingEpisodes】上次并发扫描尚未结束，跳过本次执行。")
+            return
 
-        if not host or not api_key or not user_id:
-            return []
+        if not self._tmdb_api_key:
+            logger.error("【EmbyMissingEpisodes】未配置插件专用的 TMDB API Key！扫描中止。")
+            return
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        self._is_scanning = True
+        start_time = datetime.now()
+        logger.info("【EmbyMissingEpisodes】启动基于全局内存缓存的并发缺集扫描...")
 
-        # 仅拉取顶层剧集元数据
-        series_url = (
-            f"{host}/emby/Users/{user_id}/Items?"
-            f"Recursive=true&IncludeItemTypes=Series"
-            f"&Fields=ProviderIds"
-            f"&api_key={api_key}"
-        )
-        res_series = RequestUtils().get_res(series_url)
-        if not res_series or res_series.status_code != 200:
-            return []
+        try:
+            if not self._mediaserver:
+                logger.error("【EmbyMissingEpisodes】未选择 Emby 媒体服务器！")
+                return
+
+            emby_servers = self.mediaserver_helper.get_services(name_filters=[self._mediaserver], type_filter="emby")
+            if not emby_servers:
+                logger.error(f"【EmbyMissingEpisodes】未找到匹配的 Emby 服务器。")
+                return
+
+            emby_server = list(emby_servers.values())[0]
             
-        all_series = res_series.json().get("Items", [])
-        
-        final_missing_results = []
-        workers = max(1, min(self._concurrency_workers, 16)) # 限制最大 16 线程防止炸库
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_series = {
-                executor.submit(self._process_single_series, series, host, api_key, user_id, today_str): series.get("Name")
-                for series in all_series
-            }
+            raw_host = emby_server.config.config.get("host") or ""
+            host = raw_host.rstrip('/')
+            api_key = emby_server.config.config.get("apikey")
+            user_id = emby_server.instance.get_user()
             
-            for future in concurrent.futures.as_completed(future_to_series):
-                try:
-                    result = future.result()
-                    if result:
-                        final_missing_results.extend(result)
-                except Exception as e:
-                    s_name = future_to_series[future]
-                    logger.debug(f"【EmbyMissingEpisodes】扫描剧集 {s_name} 时发生内部错误: {e}")
+            if not host or not api_key or not user_id:
+                logger.error("【EmbyMissingEpisodes】获取 Emby API 配置失败！")
+                return
 
-        # 结果排序
-        final_missing_results.sort(key=lambda x: (x["SeriesName"], x["SeasonNum"]))
-        for item in final_missing_results:
-            item.pop("SeasonNum", None)
+            proxies = self._get_proxies()
+            today = datetime.now().strftime("%Y-%m-%d")
 
-        return final_missing_results
+            # 1. 极速提取剧集外壳
+            logger.info("【EmbyMissingEpisodes】步骤 1/3: 正在拉取剧集外壳...")
+            all_series_url = (
+                f"{host}/emby/Users/{user_id}/Items?"
+                f"Recursive=true&IncludeItemTypes=Series&Fields=ProviderIds&api_key={api_key}"
+            )
+            res_series = RequestUtils().get_res(all_series_url)
+            if not res_series or res_series.status_code != 200:
+                logger.error("【EmbyMissingEpisodes】无法获取 Emby 剧集列表。")
+                return
+            all_series = res_series.json().get("Items", [])
+
+            # 2. 核心：全局构建真实物理库存 (过滤虚拟卡片，完美处理 IndexNumberEnd 合集文件)
+            logger.info("【EmbyMissingEpisodes】步骤 2/3: 正在构建全局单集内存缓冲池...")
+            all_eps_url = (
+                f"{host}/emby/Users/{user_id}/Items?"
+                f"Recursive=true&IncludeItemTypes=Episode&Fields=IndexNumberEnd,LocationType&api_key={api_key}"
+            )
+            res_eps = RequestUtils().get_res(all_eps_url)
+            all_eps_data = res_eps.json().get("Items", []) if res_eps and res_eps.status_code == 200 else []
+
+            global_inventory = defaultdict(lambda: defaultdict(set))
+            for ep in all_eps_data:
+                if ep.get("LocationType") == "Virtual":
+                    continue
+                    
+                ser_id = ep.get("SeriesId")
+                s_num = ep.get("ParentIndexNumber")
+                e_num = ep.get("IndexNumber")
+                e_end = ep.get("IndexNumberEnd")
+                
+                if not ser_id or s_num is None or e_num is None: 
+                    continue
+                
+                for i in range(e_num, (e_end if e_end else e_num) + 1):
+                    global_inventory[ser_id][s_num].add(i)
+
+            logger.info(f"【EmbyMissingEpisodes】步骤 3/3: 内存池就绪，开启 8 线程并发比对 ({len(all_series)} 部剧集)...")
+
+            # 3. TMDB 并发查漏补缺
+            final_missing_results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [
+                    executor.submit(self._process_single_series, s, global_inventory, self._tmdb_api_key, proxies, today) 
+                    for s in all_series
+                ]
+                
+                for f in concurrent.futures.as_completed(futures):
+                    res = f.result()
+                    if res:
+                        final_missing_results.extend(res)
+
+            # 4. 去重排序与保存
+            final_missing_results.sort(key=lambda x: (x["SeriesName"], x["SeasonNum"]))
+            for item in final_missing_results:
+                item.pop("SeasonNum", None)
+
+            self._cache_missing_results = final_missing_results
+            self._last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            self.save_data(self._STORAGE_DATA_KEY, self._cache_missing_results)
+            self.save_data(self._STORAGE_TIME_KEY, self._last_scan_time)
+
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.info(f"【EmbyMissingEpisodes】>>> 扫描圆满完成！耗时 {elapsed:.1f} 秒，检出 {len(final_missing_results)} 条缺失项。")
+        except Exception as e:
+            logger.error(f"【EmbyMissingEpisodes】扫描过程崩溃: {e}", exc_info=True)
+        finally:
+            self._is_scanning = False
 
     def stop_service(self):
         try:
