@@ -23,7 +23,7 @@ class EmbyLatestMediaSort(_PluginBase):
     # 插件图标
     plugin_icon = "Element_A.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.0.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
