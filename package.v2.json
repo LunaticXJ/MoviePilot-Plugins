@@ -30,13 +30,12 @@
     "name": "Emby多版本媒体检查",
     "description": "精准扫描并找出Emby库中未被自动合并、分散记录的重复/多版本电影与电视剧，支持数据看板与CSV导出。",
     "labels": "媒体库,工具",
-    "version": "2.0.1",
+    "version": "2.1.0",
     "icon": "Element_A.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
-      "v1.0.0": "新增电影分散版本检查",
-      "v2.0.0": "新增支持电视剧分散版本检查及TVDB ID比对"
+      "v2.1.0": "新增"
     }
   }
 }
