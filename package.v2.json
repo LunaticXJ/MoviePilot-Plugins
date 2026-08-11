@@ -19,11 +19,24 @@
     "description": "精准扫描并找出Emby库中电视剧缺失的集/断集情况，支持界面化数据看板展示。",
     "labels": "媒体库,工具",
     "version": "1.0.1",
-    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/emby.png",
+    "icon": "Element_A.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
       "v1.0.1": "新增"
+    }
+  },
+  "EmbyDuplicateMedia": {
+    "name": "Emby分散多版本媒体检查",
+    "description": "精准扫描并找出Emby库中未被自动合并、分散记录的重复/多版本电影与电视剧，支持数据看板与CSV导出。",
+    "labels": "媒体库,工具",
+    "version": "2.0.0",
+    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/emby.png",
+    "author": "LunaticXJ",
+    "level": 1,
+    "history": {
+      "v1.0.0": "新增电影分散版本检查",
+      "v2.0.0": "新增支持电视剧分散版本检查及TVDB ID比对"
     }
   }
 }
