@@ -23,7 +23,7 @@ class EmbyLatestMediaSort(_PluginBase):
     # 插件图标
     plugin_icon = "Element_A.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "LunaticXJ"
     # 作者主页
@@ -81,7 +81,7 @@ class EmbyLatestMediaSort(_PluginBase):
                     self._scheduler.start()
 
     def get_state(self) -> bool:
-        return False
+        return True
 
     def __update_config(self):
         self.update_config(
