@@ -3,40 +3,36 @@
     "name": "Emby最新媒体排序",
     "description": "将Emby媒体加入时间设置为发布时间，让首页最新媒体列表按发布日期倒序排列。",
     "labels": "媒体库",
-    "version": "1.4.0",
+    "version": "1.0.0",
     "icon": "Element_A.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
-      "v1.0.0": "新增",
-      "v1.1.0": "优化性能",
-      "v1.2.0": "修改BUG",
-      "v1.3.0": "进一步提升性能",
-      "v1.4.0": "修复问题"
+      "v1.0.0": "新增"
     }
   },
   "EmbyMissingEpisodes": {
     "name": "Emby剧集缺集检查",
-    "description": "精准扫描并找出Emby库中电视剧缺失的集/断集情况，支持界面化数据看板展示。",
+    "description": "查找Emby库中电视剧缺失的集/断集情况，支持数据看板展示和文件导出。",
     "labels": "媒体库,工具",
-    "version": "1.0.1",
+    "version": "1.0.0",
     "icon": "Element_A.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
-      "v1.0.1": "新增"
+      "v1.0.0": "新增"
     }
   },
   "EmbyDuplicateMedia": {
     "name": "Emby多版本媒体检查",
-    "description": "精准扫描并找出Emby库中未被自动合并、分散记录的重复/多版本电影与电视剧，支持数据看板与CSV导出。",
+    "description": "查找Emby库中重复/多版本电影与电视剧，支持数据看板展示与文件导出。",
     "labels": "媒体库,工具",
-    "version": "2.1.0",
+    "version": "1.0.0",
     "icon": "Element_A.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
-      "v2.1.0": "新增"
+      "v1.0.0": "新增"
     }
   }
 }
