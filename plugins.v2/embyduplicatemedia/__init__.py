@@ -18,7 +18,7 @@ from app.utils.http import RequestUtils
 
 class EmbyDuplicateMedia(_PluginBase):
     """
-    Emby 分散多版本媒体检查插件 v2.1.0
+    Emby 分散多版本媒体检查插件
     - 扫描 Emby 库中未被自动合并、独立分散存在的电影和电视剧记录
     - 合并名称与年份，支持多版本换行清晰展示，移除冗余的重复类别列
     - 使用原生 VTable 渲染页面，彻底解决前端白屏兼容问题
@@ -31,7 +31,7 @@ class EmbyDuplicateMedia(_PluginBase):
     plugin_name = "Emby多版本媒体检查"
     plugin_desc = "查找Emby中重复/多版本电影与电视剧。"
     plugin_icon = ""
-    plugin_version = "2.1.0"
+    plugin_version = "1.0.0"
     plugin_author = "LunaticXJ"
     author_url = "https://github.com/LunaticXJ"
     plugin_config_prefix = "embyduplicatemedia_"
