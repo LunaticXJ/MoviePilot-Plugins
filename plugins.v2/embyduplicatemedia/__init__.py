@@ -28,8 +28,8 @@ class EmbyDuplicateMedia(_PluginBase):
     # ⚙️ 分页拉取单页大小（固定 1000 条）
     PAGE_SIZE: int = 1000
 
-    plugin_name = "Emby分散多版本媒体检查"
-    plugin_desc = "查找 Emby 中未被自动合并、分散记录的重复/多版本电影与电视剧。"
+    plugin_name = "Emby多版本媒体检查"
+    plugin_desc = "查找Emby中重复/多版本电影与电视剧。"
     plugin_icon = ""
     plugin_version = "2.1.0"
     plugin_author = "LunaticXJ"
