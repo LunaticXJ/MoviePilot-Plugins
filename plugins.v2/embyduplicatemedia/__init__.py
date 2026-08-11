@@ -18,9 +18,9 @@ from app.utils.http import RequestUtils
 
 class EmbyDuplicateMedia(_PluginBase):
     """
-    Emby 分散多版本媒体检查插件 v2.0.0
+    Emby 分散多版本媒体检查插件 v2.1.0
     - 扫描 Emby 库中未被自动合并、独立分散存在的电影和电视剧记录
-    - 支持 TMDB ID、TVDB ID、IMDb ID 以及【名称+年份】三维精准归类比对
+    - 合并名称与年份，支持多版本换行清晰展示，移除冗余的重复类别列
     - 使用原生 VTable 渲染页面，彻底解决前端白屏兼容问题
     - 纯前端 Base64 CSV 无感导出，自带 UTF-8 BOM，Excel 打开无乱码
     """
@@ -31,7 +31,7 @@ class EmbyDuplicateMedia(_PluginBase):
     plugin_name = "Emby分散多版本媒体检查"
     plugin_desc = "查找 Emby 中未被自动合并、分散记录的重复/多版本电影与电视剧。"
     plugin_icon = ""
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "LunaticXJ"
     author_url = "https://github.com/LunaticXJ"
     plugin_config_prefix = "embyduplicatemedia_"
@@ -179,17 +179,17 @@ class EmbyDuplicateMedia(_PluginBase):
         output = io.StringIO()
         output.write('\ufeff')
         writer = csv.writer(output)
-        writer.writerow(["ID", "媒体类型", "名称", "年份", "重复类别", "版本数量", "版本详情"])
+        writer.writerow(["ID", "媒体类型", "名称 (年份)", "版本数量", "版本详情"])
 
         for row in self._cache_results:
+            # 导出 CSV 时用换行符 '\n'，支持 Excel 单元格内换行
+            csv_details = "\n".join(row.get("DetailsList", [])) if row.get("DetailsList") else row.get("Details", "")
             writer.writerow([
                 row.get("ID", ""),
                 row.get("TypeLabel", ""),
-                row.get("Name", ""),
-                row.get("Year", ""),
-                row.get("Category", ""),
+                row.get("NameWithYear", ""),
                 row.get("VersionCount", ""),
-                row.get("Details", "")
+                csv_details
             ])
 
         csv_bytes = output.getvalue().encode('utf-8')
@@ -246,8 +246,16 @@ class EmbyDuplicateMedia(_PluginBase):
             return [btn_row, empty_row]
 
         # 构造原生 tbody -> tr -> td 数据列
-        contents = [
-            {
+        contents = []
+        for item in self._cache_results:
+            details_list = item.get("DetailsList") or []
+            
+            # 使用原生 html 元素实现单元格内换行渲染
+            details_nodes = []
+            for idx, d in enumerate(details_list):
+                details_nodes.append({'component': 'div', 'text': str(d)})
+
+            contents.append({
                 'component': 'tr',
                 'props': {'class': 'text-sm'},
                 'content': [
@@ -259,27 +267,20 @@ class EmbyDuplicateMedia(_PluginBase):
                     {
                         'component': 'td',
                         'props': {'class': 'whitespace-nowrap text-high-emphasis'},
-                        'text': str(item.get("Name", ""))
+                        'text': str(item.get("NameWithYear", ""))
                     },
                     {
                         'component': 'td',
-                        'text': str(item.get("Year", ""))
-                    },
-                    {
-                        'component': 'td',
-                        'text': str(item.get("Category", ""))
-                    },
-                    {
-                        'component': 'td',
+                        'props': {'class': 'whitespace-nowrap text-center'},
                         'text': str(item.get("VersionCount", ""))
                     },
                     {
                         'component': 'td',
-                        'text': str(item.get("Details", ""))
+                        'props': {'class': 'py-2'},
+                        'content': details_nodes
                     }
                 ]
-            } for item in self._cache_results
-        ]
+            })
 
         # 构造原生 VTable 外壳
         table_row = {
@@ -298,27 +299,17 @@ class EmbyDuplicateMedia(_PluginBase):
                                     'content': [
                                         {
                                             'component': 'th',
-                                            'props': {'class': 'text-start ps-4'},
+                                            'props': {'class': 'text-start ps-4', 'style': 'width: 110px'},
                                             'text': '媒体类型'
                                         },
                                         {
                                             'component': 'th',
-                                            'props': {'class': 'text-start ps-4'},
-                                            'text': '名称'
+                                            'props': {'class': 'text-start ps-4', 'style': 'width: 280px'},
+                                            'text': '名称 (年份)'
                                         },
                                         {
                                             'component': 'th',
-                                            'props': {'class': 'text-start ps-4'},
-                                            'text': '年份'
-                                        },
-                                        {
-                                            'component': 'th',
-                                            'props': {'class': 'text-start ps-4'},
-                                            'text': '重复类别'
-                                        },
-                                        {
-                                            'component': 'th',
-                                            'props': {'class': 'text-start ps-4'},
+                                            'props': {'class': 'text-center ps-4', 'style': 'width: 100px'},
                                             'text': '版本数量'
                                         },
                                         {
@@ -404,7 +395,6 @@ class EmbyDuplicateMedia(_PluginBase):
             logger.error("【EmbyDuplicateMedia】Emby API 凭证或地址配置不完整！")
             return []
 
-        # 拼装包含类型
         types = [t for t in self._media_types if t in ["Movie", "Series"]]
         if not types:
             types = ["Movie", "Series"]
@@ -467,7 +457,6 @@ class EmbyDuplicateMedia(_PluginBase):
                 tvdb_id = p_ids.get("Tvdb") or p_ids.get("tvdb") or p_ids.get("TVDB")
                 imdb_id = p_ids.get("Imdb") or p_ids.get("imdb") or p_ids.get("IMDB")
 
-                # 比对维度划分
                 if tmdb_id:
                     provider_dict[(item_type, "TMDB", str(tmdb_id))].append(movie_info)
                 elif tvdb_id and item_type == "Series":
@@ -490,23 +479,24 @@ class EmbyDuplicateMedia(_PluginBase):
             if len(group) > 1:
                 all_ids = [m["ID"] for m in group]
                 all_names = list(dict.fromkeys([m["Name"] for m in group]))
+                
+                # 拼接 名称 (年份) 字段
+                name_str = " / ".join(all_names)
+                year_str = group[0]["Year"]
+                name_with_year = f"{name_str} ({year_str})" if year_str != "未知" else name_str
 
-                all_details = []
+                all_details_list = []
                 for m in group:
                     file_name = os.path.basename(m["Path"]) if m["Path"] else m["Name"]
                     detail_suffix = f": {m['Details']}" if m['Details'] else ""
-                    all_details.append(f"{file_name}{detail_suffix}")
-
-                category_label = f"{pid_type} ID一致"
+                    all_details_list.append(f"{file_name}{detail_suffix}")
 
                 final_list.append({
                     "ID": ", ".join(all_ids),
                     "TypeLabel": group[0]["TypeLabel"],
-                    "Name": " / ".join(all_names),
-                    "Year": group[0]["Year"],
-                    "Category": category_label,
+                    "NameWithYear": name_with_year,
                     "VersionCount": str(len(group)),
-                    "Details": " ‖ ".join(all_details),
+                    "DetailsList": all_details_list,
                 })
 
         # 2. 处理无唯一 ID 但【名称 + 发行年份】一致的分散组
@@ -514,20 +504,20 @@ class EmbyDuplicateMedia(_PluginBase):
             if len(group) > 1:
                 all_ids = [m["ID"] for m in group]
 
-                all_details = []
+                name_with_year = f"{name} ({year})" if year != "未知" else name
+
+                all_details_list = []
                 for m in group:
                     file_name = os.path.basename(m["Path"]) if m["Path"] else m["Name"]
                     detail_suffix = f": {m['Details']}" if m['Details'] else ""
-                    all_details.append(f"{file_name}{detail_suffix}")
+                    all_details_list.append(f"{file_name}{detail_suffix}")
 
                 final_list.append({
                     "ID": ", ".join(all_ids),
                     "TypeLabel": group[0]["TypeLabel"],
-                    "Name": name,
-                    "Year": year,
-                    "Category": "名称年份一致（无唯一ID）",
+                    "NameWithYear": name_with_year,
                     "VersionCount": str(len(group)),
-                    "Details": " ‖ ".join(all_details),
+                    "DetailsList": all_details_list,
                 })
 
         return final_list
