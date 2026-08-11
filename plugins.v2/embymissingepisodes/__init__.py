@@ -18,15 +18,15 @@ from app.utils.http import RequestUtils
 
 class EmbyMissingEpisodes(_PluginBase):
     """
-    Emby 剧集缺集检查插件 v1.0.1 (原生 VTable 渲染版)
-    - UI 重构：参照官方稳定插件彻底抛弃 VDataTable，改用原生 VTable/tr/td 手工构建 DOM，100% 解决白屏问题。
+    Emby 剧集缺集检查插件
+    - UI 重构：参照官方稳定插件彻底抛弃 VDataTable，改用原生 VTable/tr/td 手工构建 DOM，解决白屏问题。
     - 维持双轨内存拉取与动态边界 TMDB 差集算法。
     """
 
     plugin_name = "Emby剧集缺集检查"
     plugin_desc = "利用 TMDB 溯源精准比对并查找 Emby 库中的缺失剧集。"
     plugin_icon = ""
-    plugin_version = "25.0.0"
+    plugin_version = "1.0.0"
     plugin_author = "LunaticXJ"
     author_url = "https://github.com/LunaticXJ"
     plugin_config_prefix = "embymissingepisodes_"
