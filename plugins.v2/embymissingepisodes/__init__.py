@@ -13,20 +13,20 @@ from app.core.config import settings
 from app.helper.mediaserver import MediaServerHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.utils.http import RequestUtils
+from app.modules.tmdb.client import TmdbClient
 
 
 class EmbyMissingEpisodes(_PluginBase):
     """
     Emby 剧集缺集检查插件
-    - UI 重构：参照官方稳定插件彻底抛弃 VDataTable，改用原生 VTable/tr/td 手工构建 DOM，解决白屏问题。
-    - 维持双轨内存拉取与动态边界 TMDB 差集算法。
+    - 利用 MoviePilot 内置 TmdbClient 自动完成 TMDB 数据溯源比对
+    - UI 基于原生 VTable/tr/td 手工构建，完美避免白屏问题
     """
 
     plugin_name = "Emby剧集缺集检查"
     plugin_desc = "利用 TMDB 溯源精准比对并查找 Emby 库中的缺失剧集。"
     plugin_icon = ""
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "LunaticXJ"
     author_url = "https://github.com/LunaticXJ"
     plugin_config_prefix = "embymissingepisodes_"
@@ -35,7 +35,6 @@ class EmbyMissingEpisodes(_PluginBase):
 
     _onlyonce = False
     _mediaserver = ""
-    _tmdb_api_key = ""
     _ignore_season_zero = True
     _ignore_future = True
 
@@ -57,13 +56,12 @@ class EmbyMissingEpisodes(_PluginBase):
         if config:
             self._onlyonce = config.get("onlyonce", False)
             self._mediaserver = config.get("mediaserver", "")
-            self._tmdb_api_key = config.get("tmdb_api_key", "").strip()
             self._ignore_season_zero = config.get("ignore_season_zero", True)
             self._ignore_future = config.get("ignore_future", True)
 
             if self._onlyonce:
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-                logger.info("【EmbyMissingEpisodes】检查到“立即运行一次”，将在 3 秒后执行全局内存并发扫描...")
+                logger.info("【EmbyMissingEpisodes】检查到“立即运行一次”，将在 3 秒后执行扫描...")
                 self._scheduler.add_job(
                     self.scan_missing_episodes,
                     'date',
@@ -93,7 +91,6 @@ class EmbyMissingEpisodes(_PluginBase):
         self.update_config({
             "onlyonce": self._onlyonce,
             "mediaserver": self._mediaserver,
-            "tmdb_api_key": self._tmdb_api_key,
             "ignore_season_zero": self._ignore_season_zero,
             "ignore_future": self._ignore_future,
         })
@@ -110,26 +107,6 @@ class EmbyMissingEpisodes(_PluginBase):
             {
                 "component": "VForm",
                 "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "tmdb_api_key",
-                                            "label": "TMDB API Key (必填，用于拉取最准确的应有集数)",
-                                            "placeholder": "请输入 TMDB v3 API Key",
-                                            "clearable": True,
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
                     {
                         "component": "VRow",
                         "content": [
@@ -203,7 +180,6 @@ class EmbyMissingEpisodes(_PluginBase):
             }
         ], {
             "onlyonce": False,
-            "tmdb_api_key": "",
             "ignore_season_zero": True,
             "ignore_future": True,
             "mediaserver": "",
@@ -227,14 +203,10 @@ class EmbyMissingEpisodes(_PluginBase):
         return f"data:text/csv;charset=utf-8;base64,{base64_str}"
 
     def get_page(self) -> List[dict]:
-        """
-        抛弃 VDataTable，使用稳定底层的 VTable 与循环 tr td 渲染数据
-        """
         self._load_saved_data()
         csv_download_href = self._build_csv_base64_href()
         status_text = f"后台扫描中..." if self._is_scanning else f"上次扫描: {self._last_scan_time}"
 
-        # 1. 顶部操作栏 (下载按钮)
         btn_row = {
             "component": "VRow",
             "content": [
@@ -258,7 +230,6 @@ class EmbyMissingEpisodes(_PluginBase):
             ]
         }
 
-        # 2. 如果无数据，直接返回提示
         if not self._cache_missing_results:
             empty_row = {
                 "component": "VRow",
@@ -269,7 +240,7 @@ class EmbyMissingEpisodes(_PluginBase):
                         "content": [
                             {
                                 'component': 'div',
-                                'text': '暂无缺失数据或尚未运行扫描。请配置 TMDB API Key 后触发扫描。',
+                                'text': '暂无缺失数据或尚未运行扫描。',
                                 'props': {'class': 'text-center mt-4'}
                             }
                         ]
@@ -278,7 +249,6 @@ class EmbyMissingEpisodes(_PluginBase):
             }
             return [btn_row, empty_row]
 
-        # 3. 手工构造 tbody -> tr -> td 内容树
         contents = [
             {
                 'component': 'tr',
@@ -301,7 +271,6 @@ class EmbyMissingEpisodes(_PluginBase):
             } for item in self._cache_missing_results
         ]
 
-        # 4. 组装 VTable 外壳
         table_row = {
             'component': 'VRow',
             'content': [
@@ -361,7 +330,7 @@ class EmbyMissingEpisodes(_PluginBase):
         result.append(f"{start}-{prev}" if start != prev else str(start))
         return "、".join(result)
 
-    def _process_single_series(self, series: dict, global_inventory: dict, tmdb_key: str, tmdb_domain: str, today: str) -> List[Dict]:
+    def _process_single_series(self, series: dict, global_inventory: dict, tmdb_client: Any, today: str) -> List[Dict]:
         series_id = series.get("Id")
         series_name = series.get("Name", "未知剧集")
         
@@ -372,15 +341,14 @@ class EmbyMissingEpisodes(_PluginBase):
             return []
 
         local_inventory = global_inventory.get(series_id, {})
+        tv = tmdb_client.TV()
         
         try:
-            tmdb_series_url = f"https://{tmdb_domain}/3/tv/{tmdb_id}?language=zh-CN&api_key={tmdb_key}"
-            res_series = RequestUtils().get_res(tmdb_series_url)
-            
-            if not res_series or res_series.status_code != 200:
+            # 使用内置客户端查询剧集详情
+            res_series = tv.details(int(tmdb_id))
+            if not res_series or not hasattr(res_series, "seasons"):
                 return []
-                
-            tmdb_seasons = res_series.json().get("seasons", [])
+            tmdb_seasons = res_series.seasons
         except Exception as e:
             logger.debug(f"【EmbyMissingEpisodes】获取剧集 {series_name} 失败: {str(e)}")
             return []
@@ -388,8 +356,10 @@ class EmbyMissingEpisodes(_PluginBase):
         series_gaps = []
         
         for season in tmdb_seasons:
-            s_num = season.get("season_number")
-            if s_num is None or season.get("episode_count", 0) == 0: 
+            s_num = getattr(season, "season_number", None)
+            ep_count = getattr(season, "episode_count", 0)
+            
+            if s_num is None or ep_count == 0: 
                 continue
             
             if self._ignore_season_zero and s_num == 0:
@@ -397,27 +367,27 @@ class EmbyMissingEpisodes(_PluginBase):
                 
             local_season_inventory = local_inventory.get(s_num, set())
             
-            if len(local_season_inventory) >= season.get("episode_count", 0):
+            # 本地集数不小于 TMDB 标注总集数时跳过
+            if len(local_season_inventory) >= ep_count:
                 continue
 
             try:
-                tmdb_ep_url = f"https://{tmdb_domain}/3/tv/{tmdb_id}/season/{s_num}?language=zh-CN&api_key={tmdb_key}"
-                res_ep = RequestUtils().get_res(tmdb_ep_url)
-                
-                if not res_ep or res_ep.status_code != 200:
-                    continue
-                    
-                tmdb_episodes = res_ep.json().get("episodes", [])
+                # 使用内置客户端获取季度单集详情
+                season_info = tv.season_details(int(tmdb_id), s_num)
+                tmdb_episodes = getattr(season_info, "episodes", []) if season_info else []
             except Exception as e:
                 logger.debug(f"【EmbyMissingEpisodes】获取剧集 {series_name} 第 {s_num} 季失败: {str(e)}")
                 continue
                 
             missing_eps = set()
             for tmdb_ep in tmdb_episodes:
-                e_num = tmdb_ep.get("episode_number")
-                air_date = tmdb_ep.get("air_date")
+                e_num = getattr(tmdb_ep, "episode_number", None)
+                air_date = getattr(tmdb_ep, "air_date", None)
                 
-                if self._ignore_future and (not air_date or air_date >= today):
+                if e_num is None:
+                    continue
+
+                if self._ignore_future and (not air_date or str(air_date) >= today):
                     continue
                     
                 if e_num not in local_season_inventory:
@@ -438,10 +408,6 @@ class EmbyMissingEpisodes(_PluginBase):
             logger.warn("【EmbyMissingEpisodes】上次并发扫描尚未结束，跳过本次执行。")
             return
 
-        if not self._tmdb_api_key:
-            logger.error("【EmbyMissingEpisodes】未配置插件专用的 TMDB API Key！扫描中止。")
-            return
-
         self._is_scanning = True
         start_time = datetime.now()
         logger.info("【EmbyMissingEpisodes】启动基于全局内存缓存的并发缺集扫描...")
@@ -458,6 +424,7 @@ class EmbyMissingEpisodes(_PluginBase):
 
             emby_server = list(emby_servers.values())[0]
             
+            # 使用官方媒体服务封装或直接发 HTTP 请求拉取 Emby 内部库
             raw_host = emby_server.config.config.get("host") or ""
             host = raw_host.rstrip('/')
             api_key = emby_server.config.config.get("apikey")
@@ -469,35 +436,26 @@ class EmbyMissingEpisodes(_PluginBase):
 
             today = datetime.now().strftime("%Y-%m-%d")
 
-            tmdb_domain = getattr(settings, "TMDB_API_DOMAIN", "api.themoviedb.org")
-            tmdb_domain = tmdb_domain.replace("https://", "").replace("http://", "").strip("/") if tmdb_domain else "api.themoviedb.org"
-
-            logger.info(f"【EmbyMissingEpisodes】步骤 1/4: 测试 TMDB API 连通性 ({tmdb_domain})...")
-            test_url = f"https://{tmdb_domain}/3/configuration?api_key={self._tmdb_api_key}"
-            
+            # 实例化 MoviePilot 内置的 TMDB 客户端
             try:
-                test_res = RequestUtils().get_res(test_url)
-                if not test_res or test_res.status_code != 200:
-                    logger.error(f"【EmbyMissingEpisodes】⛔ TMDB 连通性测试失败！状态码: {test_res.status_code if test_res else 'None'}。")
-                    return
+                tmdb_client = TmdbClient().get_client()
             except Exception as e:
-                logger.error(f"【EmbyMissingEpisodes】⛔ TMDB 网络阻断或超时: {e}")
+                logger.error(f"【EmbyMissingEpisodes】初始化 MoviePilot 内置 TmdbClient 失败: {e}")
                 return
-                
-            logger.info("【EmbyMissingEpisodes】✅ TMDB 连通性测试通过！")
 
-            logger.info("【EmbyMissingEpisodes】步骤 2/4: 正在拉取剧集外壳...")
+            logger.info("【EmbyMissingEpisodes】步骤 1/3: 正在拉取 Emby 剧集外壳...")
             all_series_url = (
                 f"{host}/emby/Users/{user_id}/Items?"
                 f"Recursive=true&IncludeItemTypes=Series&Fields=ProviderIds&api_key={api_key}"
             )
+            from app.utils.http import RequestUtils
             res_series = RequestUtils().get_res(all_series_url)
             if not res_series or res_series.status_code != 200:
                 logger.error("【EmbyMissingEpisodes】无法获取 Emby 剧集列表。")
                 return
             all_series = res_series.json().get("Items", [])
 
-            logger.info("【EmbyMissingEpisodes】步骤 3/4: 正在构建全局单集内存缓冲池 (完美兼容合集解析)...")
+            logger.info("【EmbyMissingEpisodes】步骤 2/3: 正在构建全局单集内存缓冲池...")
             all_eps_url = (
                 f"{host}/emby/Users/{user_id}/Items?"
                 f"Recursive=true&IncludeItemTypes=Episode&Fields=IndexNumberEnd,LocationType&api_key={api_key}"
@@ -528,12 +486,12 @@ class EmbyMissingEpisodes(_PluginBase):
                 for i in range(e_num, e_end + 1):
                     global_inventory[ser_id][s_num].add(i)
 
-            logger.info(f"【EmbyMissingEpisodes】步骤 4/4: 内存池就绪，开启 8 线程并发 TMDB 比对 (共 {len(all_series)} 部剧集)...")
+            logger.info(f"【EmbyMissingEpisodes】步骤 3/3: 内存池就绪，开启 8 线程并发调用内置 TmdbClient (共 {len(all_series)} 部剧集)...")
 
             final_missing_results = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
-                    executor.submit(self._process_single_series, s, global_inventory, self._tmdb_api_key, tmdb_domain, today) 
+                    executor.submit(self._process_single_series, s, global_inventory, tmdb_client, today) 
                     for s in all_series
                 ]
                 
