@@ -15,12 +15,12 @@
     "name": "Emby剧集缺集检查",
     "description": "查找Emby库中电视剧缺失的集/断集情况，支持数据看板展示和文件导出。",
     "labels": "媒体库,工具",
-    "version": "1.0.2",
+    "version": "1.0.0",
     "icon": "Element_A.png",
     "author": "LunaticXJ",
     "level": 1,
     "history": {
-      "v1.0.2": "新增"
+      "v1.0.0": "新增"
     }
   },
   "EmbyDuplicateMedia": {
