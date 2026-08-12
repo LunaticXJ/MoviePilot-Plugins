@@ -27,7 +27,7 @@ class EmbyMissingEpisodes(_PluginBase):
     plugin_name = "Emby剧集缺集检查"
     plugin_desc = "利用 TMDB 溯源精准比对并查找 Emby 库中的缺失剧集。"
     plugin_icon = ""
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.0"
     plugin_author = "LunaticXJ"
     author_url = "https://github.com/LunaticXJ"
     plugin_config_prefix = "embymissingepisodes_"
@@ -336,21 +336,27 @@ class EmbyMissingEpisodes(_PluginBase):
         series_name = series.get("Name", "未知剧集")
         
         provider_ids = series.get("ProviderIds") or {}
-        tmdb_id = provider_ids.get("Tmdb") or provider_ids.get("tmdb") or provider_ids.get("TMDB")
+        tmdb_id_raw = provider_ids.get("Tmdb") or provider_ids.get("tmdb") or provider_ids.get("TMDB")
         
-        if not tmdb_id:
+        if not tmdb_id_raw:
+            return []
+
+        # 确保 TMDB ID 是有效数字
+        try:
+            tmdb_id = int(tmdb_id_raw)
+        except (ValueError, TypeError):
             return []
 
         local_inventory = global_inventory.get(series_id, {})
         
         try:
             # 调用 Mp 的 TmdbApi 获取电视剧详情
-            res_series = tmdb_api.get_info(mtype=MediaType.TV, tmdbid=int(tmdb_id))
-            if not res_series:
+            res_series = tmdb_api.get_info(mtype=MediaType.TV, tmdbid=tmdb_id)
+            if not res_series or not isinstance(res_series, dict):
                 return []
             tmdb_seasons = res_series.get("seasons", [])
         except Exception as e:
-            logger.debug(f"【EmbyMissingEpisodes】获取剧集 {series_name} 失败: {str(e)}")
+            logger.debug(f"【EmbyMissingEpisodes】获取剧集 {series_name} (TMDB ID: {tmdb_id}) 失败: {str(e)}")
             return []
 
         series_gaps = []
@@ -367,13 +373,16 @@ class EmbyMissingEpisodes(_PluginBase):
                 
             local_season_inventory = local_inventory.get(s_num, set())
             
+            # 本地已有的集数不小于 TMDB 标注集数时跳过，避免无效请求
             if len(local_season_inventory) >= ep_count:
                 continue
 
             try:
                 # 调用 Mp 的 TmdbApi 获取指定季的单集详情
-                season_info = tmdb_api.get_tv_season_detail(tmdbid=int(tmdb_id), season=s_num)
-                tmdb_episodes = season_info.get("episodes", []) if season_info else []
+                season_info = tmdb_api.get_tv_season_detail(tmdbid=tmdb_id, season=s_num)
+                if not season_info or not isinstance(season_info, dict):
+                    continue
+                tmdb_episodes = season_info.get("episodes", [])
             except Exception as e:
                 logger.debug(f"【EmbyMissingEpisodes】获取剧集 {series_name} 第 {s_num} 季失败: {str(e)}")
                 continue
